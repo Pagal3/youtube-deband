@@ -91,7 +91,9 @@ are untested, and on mobile there is no DB button.
 
 - DRM protected video (purchased or rented movies, some Premium content).
   Browsers don't let WebGL read it.
-- HDR (PQ/HLG, BT.2020). The color conversion only covers SDR BT.709/BT.601.
+- HDR (PQ/HLG, BT.2020). Browsers don't give scripts the full HDR signal:
+  WebGL receives it cut to 8 bits, and WebGPU receives it already converted
+  to SDR, so debanding it would look worse than the video it replaces.
   YouTube sends HDR only to HDR displays, so on an SDR display you get the SDR
   version, which is debanded as usual. Detecting HDR needs WebCodecs
   (`VideoFrame`).
