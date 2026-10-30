@@ -1,10 +1,11 @@
 // ==UserScript==
 // @name         YouTube Deband (mpv / libplacebo)
 // @namespace    youtube-deband
-// @version      1.5.0
+// @version      1.5.1
 // @description  Debands YouTube video in WebGL2 using a port of mpv's deband shaders (vo=gpu-next / libplacebo and legacy vo=gpu), with mpv's parameters.
 // @match        *://*.youtube.com/*
 // @match        *://www.youtube-nocookie.com/*
+// @exclude      *://music.youtube.com/*
 // @license      LGPL-2.1-or-later
 // @homepageURL  https://github.com/Pagal3/youtube-deband
 // @downloadURL  https://raw.githubusercontent.com/Pagal3/youtube-deband/main/youtube-deband.user.js
@@ -65,7 +66,7 @@
     const MATRICES = { '709': [0.2126, 0.0722], '601': [0.299, 0.114] };
 
     const settings = loadSettings();
-    console.info(`[yt-deband] 1.5.0 running; ${settings.hotkeyPanel} or the DB player button opens the settings`);
+    console.info(`[yt-deband] 1.5.1 running; ${settings.hotkeyPanel} or the DB player button opens the settings`);
 
     function loadSettings() {
         try {
@@ -899,6 +900,41 @@ void main() {
         requestAnimationFrame(draw);
     }
 
+    // Why the current video can't be debanded, or null
+    function skipReason() {
+        // EME protected video uploads as black (or not at all)
+        if (video.mediaKeys)
+            return 'protected (DRM) video, which browsers do not let WebGL read.';
+        if (video.videoWidth > debander.maxSize || video.videoHeight > debander.maxSize)
+            return `${video.videoWidth}x${video.videoHeight} video exceeds this browser's ` +
+                   `${debander.maxSize}px WebGL texture limit (fingerprinting protection). Use 1080p or lower.`;
+        if (hdrStream())
+            return 'HDR video (PQ/HLG or BT.2020); only SDR BT.709/BT.601 is supported.';
+        return null;
+    }
+
+    // YouTube only serves HDR streams to HDR displays. The stream's color
+    // space comes from a WebCodecs VideoFrame, probed once per stream and
+    // resolution; without WebCodecs it is assumed to be SDR.
+    let hdrProbe = { key: null, hdr: false };
+    function hdrStream() {
+        const key = `${video.currentSrc} ${video.videoWidth}x${video.videoHeight}`;
+        if (hdrProbe.key === key || typeof VideoFrame === 'undefined')
+            return hdrProbe.hdr;
+        let hdr = false;
+        try {
+            const frame = new VideoFrame(video);
+            const cs = frame.colorSpace;
+            frame.close();
+            hdr = cs.transfer === 'pq' || cs.transfer === 'hlg' ||
+                  cs.primaries === 'bt2020' || cs.matrix === 'bt2020-ncl';
+        } catch (e) {
+            return false; // no frame yet, retry on the next draw
+        }
+        hdrProbe = { key, hdr };
+        return hdr;
+    }
+
     function draw() {
         if (!video || !canvas)
             return;
@@ -907,12 +943,12 @@ void main() {
             canvas.style.display = 'none';
             return;
         }
-        // Too big for this browser's textures: play the video undebanded and
-        // pick up again when the quality drops (not an error that stops retrying)
-        if (video.videoWidth > debander.maxSize || video.videoHeight > debander.maxSize) {
+        // Video this script can't handle: play it undebanded and pick up again
+        // when that changes (not an error that stops retrying)
+        const skip = skipReason();
+        if (skip) {
             canvas.style.display = 'none';
-            const msg = `Skipped: ${video.videoWidth}x${video.videoHeight} video exceeds this browser's ` +
-                        `${debander.maxSize}px WebGL texture limit (fingerprinting protection). Use 1080p or lower.`;
+            const msg = 'Skipped: ' + skip;
             if (status !== msg) {
                 setStatus(msg);
                 showNotice('YouTube Deband: ' + msg);

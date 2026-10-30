@@ -66,6 +66,40 @@ Both hotkeys can be re-recorded in the panel.
 The panel also has the YCbCr matrix (709/601), luma snapping, output dithering,
 upload precision, WebGL backend and a split-screen comparison view.
 
+## Compatibility
+
+**Browsers**
+
+| Browser                         | Status                                                          |
+|---------------------------------|-----------------------------------------------------------------|
+| Chrome, Edge, Brave, Opera      | Full support                                                    |
+| Firefox                         | Full support; before 132 it renders per display frame instead of per video frame |
+| Safari 15.4+                    | Should work, less tested                                        |
+| Tor / Mullvad Browser           | WebGL1 fallback; fingerprinting protection limits video to 1080p |
+| WebGL disabled (NoScript, safest security level) | Not supported; the video plays normally        |
+
+**Userscript managers:** Violentmonkey (recommended), Tampermonkey,
+Greasemonkey, FireMonkey and Userscripts for Safari. The script uses no
+`GM_*` APIs. Settings are kept in youtube.com's `localStorage`, so clearing
+YouTube's site data resets them.
+
+**Pages:** watch pages, theater mode, fullscreen and embeds (including
+youtube-nocookie.com). YouTube Music is excluded. Shorts and m.youtube.com
+are untested, and on mobile there is no DB button.
+
+**Videos it skips** (it shows a notice, and the video plays undebanded):
+
+- DRM protected video (purchased or rented movies, some Premium content).
+  Browsers don't let WebGL read it.
+- HDR (PQ/HLG, BT.2020). The color conversion only covers SDR BT.709/BT.601.
+  YouTube sends HDR only to HDR displays, so on an SDR display you get the SDR
+  version, which is debanded as usual. Detecting HDR needs WebCodecs
+  (`VideoFrame`).
+- Resolutions above the browser's WebGL texture limit.
+
+SD videos encoded as BT.601 need the matrix set to 601 in the panel for exact
+colors. 4K and higher work, but the cost grows with resolution.
+
 ## License
 
 LGPL-2.1-or-later, matching libplacebo and mpv, whose shaders this ports.
