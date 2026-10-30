@@ -6,6 +6,9 @@
 // @match        *://*.youtube.com/*
 // @match        *://www.youtube-nocookie.com/*
 // @license      LGPL-2.1-or-later
+// @homepageURL  https://github.com/Pagal3/youtube-deband
+// @downloadURL  https://raw.githubusercontent.com/Pagal3/youtube-deband/main/youtube-deband.user.js
+// @updateURL    https://raw.githubusercontent.com/Pagal3/youtube-deband/main/youtube-deband.user.js
 // @grant        none
 // @inject-into  content
 // @run-at       document-start

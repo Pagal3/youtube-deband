@@ -16,8 +16,9 @@ planes, debands each one, converts back and draws on a canvas laid over the
 
 1. Install a userscript manager such as [Violentmonkey](https://violentmonkey.github.io/)
    or [Tampermonkey](https://www.tampermonkey.net/).
-2. Open [`youtube-deband.user.js`](youtube-deband.user.js), click **Raw**, and
-   confirm the install.
+2. Open the [raw script](https://raw.githubusercontent.com/Pagal3/youtube-deband/main/youtube-deband.user.js)
+   and confirm the install. Your userscript manager will pick up updates from
+   the same URL.
 
 ## Usage
 
