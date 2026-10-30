@@ -12,6 +12,33 @@ conversion: the script undoes the browser's YCbCr→RGB conversion, rebuilds the
 planes, debands each one, converts back and draws on a canvas laid over the
 `<video>`. Runs on WebGL2, with a WebGL1 fallback (e.g. Tor/Mullvad Browser).
 
+## Comparison
+
+YouTube's 720p stream of Sintel at 0:35, default settings. Left half is the
+video as the browser shows it, right half is debanded:
+
+![Original vs debanded, foggy sky](docs/sky.png)
+
+Banding is easiest to see with the contrast boosted (both halves get the same
+curve):
+
+![Original vs debanded, contrast boosted](docs/sky-boosted.png)
+
+![Original vs debanded, sunset at 5:10, contrast boosted](docs/sunset-boosted.png)
+
+<sub>Sintel © Blender Foundation, [CC BY 3.0](https://creativecommons.org/licenses/by/3.0/), [durian.blender.org](https://durian.blender.org)</sub>
+
+Near-black backgrounds band too. A talking-head video at 720p, 0:10:
+
+![Original vs debanded, dark background](docs/dark.png)
+
+With the darkest 8% stretched to full range, the original's background turns
+out to be a few flat blocks of brightness:
+
+![Original vs debanded, dark background, shadows lifted](docs/dark-boosted.png)
+
+<sub>Frame from [the largest hack. ever.](https://www.youtube.com/watch?v=_HaySrzDyWU) by voidzilla</sub>
+
 ## Install
 
 1. Install a userscript manager such as [Violentmonkey](https://violentmonkey.github.io/)
