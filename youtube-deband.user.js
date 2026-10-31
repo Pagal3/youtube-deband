@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube Deband (mpv / libplacebo)
 // @namespace    youtube-deband
-// @version      1.8.0
+// @version      1.9.0
 // @description  Debands YouTube video in WebGL2 using a port of mpv's deband shaders (vo=gpu-next / libplacebo and legacy vo=gpu), with mpv's parameters.
 // @match        *://*.youtube.com/*
 // @match        *://www.youtube-nocookie.com/*
@@ -25,12 +25,17 @@
  * (so the chroma radius is in chroma pixels and the PRNG is seeded per plane
  * pixel), then converts back to RGB and draws onto a canvas laid over the
  * <video>. Luma is debanded inside that final pass to save a render target.
+ * Optionally the browser's chroma upscaling is replaced with Chroma from
+ * Luma prediction on the rebuilt planes.
  *
  * Shaders:
  *   gpu-next: libplacebo src/shaders/sampling.c pl_shader_deband() with
  *             mpv's option mapping from video/out/vo_gpu_next.c
  *   gpu:      mpv video/out/gpu/video_shaders.c pass_sample_deband()
  *   fast:     gpu-next cut down to one pass over the RGB frame, for weak GPUs
+ *   CfL:      CfL_Prediction.glsl and CfL_Prediction_Lite.glsl from
+ *             github.com/Artoriuz/glsl-chroma-from-luma-prediction (MIT,
+ *             notice with the port)
  *
  * Hotkeys (default): Ctrl+Alt+D toggles debanding, Ctrl+Alt+B opens the
  * settings panel; both can be re-recorded in the panel. The DB button in the
@@ -42,7 +47,7 @@
 
     const STORAGE_KEY = 'yt-deband-settings';
     const PRESETS_KEY = 'yt-deband-presets'; // the user's own presets, apart so Reset keeps them
-    const VERSION = '1.8.0'; // keep in sync with @version
+    const VERSION = '1.9.0'; // keep in sync with @version
 
     // Option ranges match mpv's deband_conf (video/out/gpu/video_shaders.c)
     const DEFAULTS = {
@@ -53,6 +58,7 @@
         range: 16,          // --deband-range=<1..64>
         grain: 32,          // --deband-grain=<0..4096>
         preset: 'Default',  // preset picked last, shown while the four values above still match it
+        chroma: 'browser',  // chroma upscaling: 'browser' (keep its) | 'cfl' | 'cfl-lite' (Chroma from Luma)
         matrix: '709',      // YCbCr matrix the browser used to make RGB
         snap: true,         // round the recovered luma to the 8-bit code grid
         dither: true,       // dither the output down to 8 bits like mpv does
@@ -244,12 +250,33 @@ void main() {
     // Half resolution (4:2:0) chroma plane, center sited: the average of each
     // 2x2 block. YCbCr is linear in RGB, so one bilinear fetch from the
     // block's middle averages it (clamping to the edge for odd sizes).
+    // With u_luma it makes luma at that resolution instead, for CfL Lite
+    // (libplacebo samples its LUMA there bilinearly, which is the same).
     const FS_PREP_C = YCC + `
+uniform sampler2D u_src;
+uniform vec2 u_srcSize;
+uniform bool u_luma;
+void main() {
+    vec2 mid = floor(gl_FragCoord.xy) * 2.0 + 1.0;
+    vec3 c = rgb2ycc(TEX(u_src, mid / u_srcSize).rgb);
+    FRAG = storePlane(u_luma ? vec2(c.x, 0.0) : c.yz);
+}`;
+
+    // Luma at chroma resolution for the full CfL: the 4x4 luma pixels
+    // around each chroma pixel weighted by its Hermite kernel,
+    // smoothstep(1 - d) at d = 0.75 and 0.25 chroma pixels, i.e. 0.078 0.422
+    // 0.422 0.078 on each axis. Each pair is one bilinear fetch, 0.65625
+    // pixels either side of the middle.
+    const FS_PREP_YL = YCC + `
 uniform sampler2D u_src;
 uniform vec2 u_srcSize;
 void main() {
     vec2 mid = floor(gl_FragCoord.xy) * 2.0 + 1.0;
-    FRAG = storePlane(rgb2ycc(TEX(u_src, mid / u_srcSize).rgb).yz);
+    vec3 rgb = TEX(u_src, (mid + vec2(-0.65625, -0.65625)) / u_srcSize).rgb
+             + TEX(u_src, (mid + vec2( 0.65625, -0.65625)) / u_srcSize).rgb
+             + TEX(u_src, (mid + vec2(-0.65625,  0.65625)) / u_srcSize).rgb
+             + TEX(u_src, (mid + vec2( 0.65625,  0.65625)) / u_srcSize).rgb;
+    FRAG = storePlane(vec2(rgb2ycc(0.25 * rgb).x, 0.0));
 }`;
 
     // libplacebo sh_prng(): pcg3d (http://jcgt.org/published/0009/03/02/),
@@ -450,11 +477,14 @@ void main() {
     // top of the source pixel, so the lossy RGB -> 4:2:0 -> RGB round trip
     // never shows up where nothing was debanded (e.g. sharp colored edges).
     // lumaDelta is the expression for the luma change at plane pixel p.
-    const fsFinal = (deband, lumaDelta) => YCC + deband + `
+    // upscale is code for chroma upscaling that replaces the browser's (see
+    // UPSCALE_CFL), or empty.
+    const fsFinal = (deband, lumaDelta, upscale) => YCC + deband + `
 uniform sampler2D u_c, u_src;
 uniform vec2 u_size, u_csize;
 uniform bool u_dither;
 uniform float u_split;
+${upscale}
 void main() {
     vec2 p = vec2(floor(gl_FragCoord.x), u_size.y - 1.0 - floor(gl_FragCoord.y));
     vec2 uv = (p + 0.5) / u_size;
@@ -462,6 +492,11 @@ void main() {
     if (p.x >= u_split * u_size.x) {
         vec2 cuv = (p + 0.5) / (2.0 * u_csize);
         vec2 dc = loadPlaneLinear(u_c, cuv, u_csize) - DELTA_BIAS;
+#ifdef UPSCALE_CHROMA
+        // The change from the browser's upscaled chroma is a chroma change too
+        vec3 ycc = rgb2ycc(rgb);
+        dc += upscaleChroma(p, uv, ycc.x) - ycc.yz;
+#endif
         rgb += dycc2rgb(vec3(${lumaDelta}, dc));
     }
     if (u_dither) {
@@ -528,17 +563,219 @@ void main() {
     FRAG = vec4(clamp(rgb, 0.0, 1.0), 1.0);
 }`;
 
+    // ------------------------------------------------------------------
+    // Chroma from Luma (CfL) prediction, ported from CfL_Prediction.glsl and
+    // CfL_Prediction_Lite.glsl of
+    // https://github.com/Artoriuz/glsl-chroma-from-luma-prediction in their
+    // default configuration, under this notice:
+    //
+    // MIT License
+    //
+    // Copyright (c) 2023 João Chrisóstomo
+    //
+    // Permission is hereby granted, free of charge, to any person obtaining a copy
+    // of this software and associated documentation files (the "Software"), to deal
+    // in the Software without restriction, including without limitation the rights
+    // to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+    // copies of the Software, and to permit persons to whom the Software is
+    // furnished to do so, subject to the following conditions:
+    //
+    // The above copyright notice and this permission notice shall be included in all
+    // copies or substantial portions of the Software.
+    //
+    // THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    // IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    // FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+    // AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+    // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+    // SOFTWARE.
+    //
+    // Least squares fits of chroma to luma over the chroma pixels around a
+    // pixel predict its chroma from its own luma, and the prediction is mixed
+    // into a spatial interpolation by how well luma and chroma correlate
+    // there. mpv runs it on the debanded planes; here it runs on the planes
+    // before debanding and the final pass adds the deband change on top, so
+    // luma needn't be debanded into a plane of its own first.
+    // ------------------------------------------------------------------
+
+    // CfL on the 4:2:0 planes: luma u_yl and chroma u_cl, both at chroma
+    // resolution u_csize (declared by the including shader). cfl(p, y) is the
+    // chroma at the full resolution pixel p, whose luma is y. Written without
+    // arrays, which GLSL ES 1.00 can only index by loop counters.
+    const CFL = `
+uniform sampler2D u_yl, u_cl;
+
+vec2 lowUv(vec2 t) {
+    return (clamp(t, vec2(0.0), u_csize - 1.0) + 0.5) / u_csize;
+}
+
+// Sums for a least squares fit of chroma to luma over n samples, each
+// taken relative to a reference sample to keep float precision
+struct Fit { float n, y, yy; vec2 c, cc, yc; };
+
+Fit fitAdd(Fit a, Fit b) {
+    return Fit(a.n + b.n, a.y + b.y, a.yy + b.yy, a.c + b.c, a.cc + b.cc, a.yc + b.yc);
+}
+
+// Chroma the fit predicts for luma y; (y0, c0) is the reference sample
+vec2 fitPredict(Fit f, float y, float y0, vec2 c0) {
+    float yvar = max(f.yy - f.y * f.y / f.n, 0.0);
+    vec2 alpha = (f.yc - f.y * f.c / f.n) / max(yvar, 1e-6);
+    return clamp(c0 + f.c / f.n + alpha * (y - y0 - f.y / f.n), 0.0, 1.0);
+}
+
+// Correlation of luma and chroma over the fit's samples
+vec2 fitCorr(Fit f) {
+    float yvar = max(f.yy - f.y * f.y / f.n, 0.0);
+    vec2 cvar = max(f.cc - f.c * f.c / f.n, 0.0);
+    return clamp(abs(f.yc - f.y * f.c / f.n) / max(sqrt(yvar * cvar), 1e-6), 0.0, 1.0);
+}
+
+// Weight in the spatial interpolation of a chroma pixel v chroma pixels away
+float cflWeight(vec2 v) {
+#ifdef CFL_LITE
+    float d2 = min(dot(v, v), 4.0);
+    float d4 = d2 * d2;
+    return (d4 - 8.0 * d2 + 16.0) * (d4 - 5.0 * d2 + 4.0);
+#else
+    float d = min(length(v), 2.0);
+    float d2 = d * d;
+    float d3 = d2 * d;
+    return d < 1.0 ? 1.25 * d3 - 2.25 * d2 + 1.0 : -0.75 * d3 + 3.75 * d2 - 6.0 * d + 3.0;
+#endif
+}
+
+vec2 cfl(vec2 p, float y) {
+    // The chroma pixel up-left of p, and p's position from it
+    vec2 pp = (p + 0.5) * 0.5 - 0.5;
+    vec2 fp = floor(pp);
+    pp -= fp;
+
+    // Over the 4x4 chroma pixels around p: the spatial interpolation, the
+    // chroma range of the inner 2x2 to limit its ringing, the luma range,
+    // and fits over the inner 2x2 (fi), above and below it (fv) and either
+    // side of it (fh). The corners only count in the full variant's
+    // interpolation.
+    float y0 = loadPlane(u_yl, lowUv(fp)).x;
+    vec2 c0 = loadPlane(u_cl, lowUv(fp));
+    float ymin = y0, ymax = y0, wt = 0.0;
+    vec2 cmin = c0, cmax = c0, ct = vec2(0.0);
+    Fit fi = Fit(0.0, 0.0, 0.0, vec2(0.0), vec2(0.0), vec2(0.0));
+    Fit fv = fi, fh = fi;
+    for (int j = -1; j <= 2; j++) {
+        for (int i = -1; i <= 2; i++) {
+            bool inx = i == 0 || i == 1, iny = j == 0 || j == 1;
+            bool corner = !inx && !iny;
+#ifdef CFL_LITE
+            if (corner)
+                continue;
+#endif
+            vec2 o = vec2(float(i), float(j));
+            vec2 uv = lowUv(fp + o);
+            vec2 c = loadPlane(u_cl, uv);
+            float w = cflWeight(o - pp);
+            wt += w;
+            ct += w * c;
+            if (corner)
+                continue;
+            float yl = loadPlane(u_yl, uv).x;
+            ymin = min(ymin, yl);
+            ymax = max(ymax, yl);
+            float dy = yl - y0;
+            vec2 dc = c - c0;
+            Fit s = Fit(1.0, dy, dy * dy, dc, dc * dc, dy * dc);
+            if (inx && iny) {
+                cmin = min(cmin, c);
+                cmax = max(cmax, c);
+                fi = fitAdd(fi, s);
+            } else if (inx) {
+                fv = fitAdd(fv, s);
+            } else {
+                fh = fitAdd(fh, s);
+            }
+        }
+    }
+    vec2 spatial = ct / wt;
+    spatial = clamp(mix(spatial, clamp(spatial, cmin, cmax), 0.8), 0.0, 1.0);
+
+    // Mix in the prediction by the correlation over all 12, less where y is
+    // far outside their luma range
+    Fit f12 = fitAdd(fitAdd(fi, fv), fh);
+    vec2 corr = fitCorr(f12);
+    corr *= corr;
+    float extrapolation = max(max(y - ymax, ymin - y), 0.0) / max(ymax - ymin, 1e-6);
+    vec2 mixCoeff = 0.8 * corr * corr * clamp((8.0 - extrapolation) / 4.0, 0.0, 1.0);
+#ifdef CFL_LITE
+    vec2 pred = fitPredict(f12, y, y0, c0);
+#else
+    vec2 pred8 = mix(fitPredict(fitAdd(fi, fv), y, y0, c0), fitPredict(fitAdd(fi, fh), y, y0, c0), 0.5);
+    vec2 pred = mix(fitPredict(f12, y, y0, c0), pred8, 0.5);
+#endif
+    return clamp(mix(spatial, pred, mixCoeff), 0.0, 1.0);
+}
+`;
+
+    // The full CfL's prediction at each full resolution pixel. It gets a pass
+    // of its own because its last step (UPSCALE_CFL) needs the neighbors'.
+    const FS_CFL = YCC + `
+uniform sampler2D u_src;
+uniform vec2 u_size, u_csize;
+` + CFL + `
+void main() {
+    vec2 p = floor(gl_FragCoord.xy);
+    FRAG = storePlane(cfl(p, rgb2ycc(TEX(u_src, (p + 0.5) / u_size).rgb).x));
+}`;
+
+    // Chroma upscaling in the final pass (see fsFinal): upscaleChroma(p, uv, y)
+    // is the chroma at plane pixel p, at texture coordinate uv, with luma y.
+    // The full CfL's last step: a 3x3 joint bilateral filter over its
+    // prediction u_pred, weighted by distance and luma difference with the
+    // default distance_coeff (2) and intensity_coeff (128). u_tex is the
+    // deband code's luma plane.
+    const UPSCALE_CFL = `
+uniform sampler2D u_pred;
+#define UPSCALE_CHROMA
+vec2 upscaleChroma(vec2 p, vec2 uv, float y) {
+    vec2 d = 1.0 / u_size;
+    float y0 = loadPlane(u_tex, uv).x;
+    float wt = 0.0;
+    vec2 ct = vec2(0.0);
+    for (int j = -1; j <= 1; j++) {
+        for (int i = -1; i <= 1; i++) {
+            vec2 o = vec2(float(i), float(j));
+            float dy = y0 - loadPlane(u_tex, uv + o * d).x;
+            float w = max(100.0 * exp(-2.0 * dot(o, o) - 128.0 * dy * dy), 1e-32);
+            wt += w;
+            ct += w * loadPlane(u_pred, uv + o * d);
+        }
+    }
+    return clamp(ct / wt, 0.0, 1.0);
+}`;
+    // CfL Lite has no such step, so it runs in the final pass
+    const UPSCALE_CFL_LITE = '#define CFL_LITE\n' + CFL + `
+#define UPSCALE_CHROMA
+vec2 upscaleChroma(vec2 p, vec2 uv, float y) { return cfl(p, y); }`;
+
     // Fragment shader of each program. They are compiled on first use, so a
     // weak GPU only compiles the mode it runs.
     const PROGRAMS = {
         prepY: FS_PREP_Y,
         prepC: FS_PREP_C,
+        prepYL: FS_PREP_YL,
+        cfl: FS_CFL,
         nextC: fsChroma(debandNext(2)),
-        nextFinal: fsFinal(debandNext(1), 'deband(p)'),
+        nextFinal: fsFinal(debandNext(1), 'deband(p)', ''),
+        nextFinalCfl: fsFinal(debandNext(1), 'deband(p)', UPSCALE_CFL),
+        nextFinalCflLite: fsFinal(debandNext(1), 'deband(p)', UPSCALE_CFL_LITE),
         legacyC: fsChroma(DEBAND_LEGACY),
-        legacyFinal: fsFinal(DEBAND_LEGACY, 'deband(p).x'),
+        legacyFinal: fsFinal(DEBAND_LEGACY, 'deband(p).x', ''),
+        legacyFinalCfl: fsFinal(DEBAND_LEGACY, 'deband(p).x', UPSCALE_CFL),
+        legacyFinalCflLite: fsFinal(DEBAND_LEGACY, 'deband(p).x', UPSCALE_CFL_LITE),
         fast: FS_FAST,
     };
+    // Final pass program suffix per chroma upscaling
+    const FINAL_CHROMA = { browser: '', cfl: 'Cfl', 'cfl-lite': 'CflLite' };
 
     // ------------------------------------------------------------------
     // WebGL renderer
@@ -553,6 +790,7 @@ void main() {
             this.h = 0;
             this.uploadFormat = null;
             this.fast = false;
+            this.chroma = 'browser';
             this.textures = [];
             this.fbos = [];
             this.init(backend);
@@ -619,7 +857,8 @@ void main() {
         get description() {
             return `${this.webgl2 ? 'WebGL2' : 'WebGL1'}, ` +
                    `${this.fast ? 'single pass' : (this.packed ? 'packed 16-bit' : 'float') + ' planes'}, ` +
-                   `${this.uploadFormat === 'half' ? 'RGBA16F' : 'RGBA8'} upload`;
+                   `${this.uploadFormat === 'half' ? 'RGBA16F' : 'RGBA8'} upload` +
+                   (this.chroma === 'cfl' ? ', CfL chroma' : this.chroma === 'cfl-lite' ? ', CfL Lite chroma' : '');
         }
 
         prog(name) {
@@ -709,7 +948,10 @@ void main() {
             // aren't guaranteed to filter with more than 8 bits of precision.
             // Fast mode has no planes.
             const yFormat = fast ? null : s.snap && s.algo !== 'gpu' ? gl.R8 : gl.R16F;
-            if (w === this.w && h === this.h && precision === this.uploadFormat && yFormat === this.yFormat)
+            // CfL works on the planes, which Fast mode doesn't make
+            const chroma = !fast && (s.chroma === 'cfl' || s.chroma === 'cfl-lite') ? s.chroma : 'browser';
+            if (w === this.w && h === this.h && precision === this.uploadFormat && yFormat === this.yFormat &&
+                chroma === this.chroma)
                 return;
             for (const t of this.textures) gl.deleteTexture(t);
             for (const f of this.fbos) gl.deleteFramebuffer(f);
@@ -724,6 +966,12 @@ void main() {
                 this.cPrep = this.target(cw, ch, gl.RG16F);
                 this.cDelta = this.target(cw, ch, gl.RG16F);
             }
+            // CfL's luma at chroma resolution, and the full CfL's prediction
+            // before its last step
+            if (chroma !== 'browser')
+                this.yLow = this.target(cw, ch, gl.R16F);
+            if (chroma === 'cfl')
+                this.cPred = this.target(w, h, gl.RG16F);
 
             this.canvas.width = w;
             this.canvas.height = h;
@@ -732,6 +980,7 @@ void main() {
             this.uploadFormat = precision;
             this.yFormat = yFormat;
             this.fast = fast;
+            this.chroma = chroma;
             this.checkUpload = true;
         }
 
@@ -848,15 +1097,39 @@ void main() {
                 gl.uniform1i(loc.u_snap, s.snap ? 1 : 0);
             });
             // The 2x2 average needs bilinear filtering of the source
-            this.pass(this.prog('prepC'), this.cPrep, [['u_src', this.src, true]], setSrc);
+            const prepLow = (out, luma) => this.pass(this.prog('prepC'), out, [['u_src', this.src, true]], (loc) => {
+                setSrc(loc);
+                gl.uniform1i(loc.u_luma, luma ? 1 : 0);
+            });
+            prepLow(this.cPrep, false);
+
+            // CfL Lite finishes in the final pass, the full CfL before it
+            let upscaleInputs = [];
+            if (this.chroma === 'cfl-lite') {
+                prepLow(this.yLow, true);
+                upscaleInputs = [['u_yl', this.yLow.tex, false], ['u_cl', this.cPrep.tex, false]];
+            } else if (this.chroma === 'cfl') {
+                this.pass(this.prog('prepYL'), this.yLow, [['u_src', this.src, true]], setSrc);
+                this.pass(this.prog('cfl'), this.cPred, [
+                    ['u_yl', this.yLow.tex, false],
+                    ['u_cl', this.cPrep.tex, false],
+                    ['u_src', this.src, false],
+                ], (loc) => {
+                    gl.uniform2f(loc.u_k, k[0], k[1]);
+                    gl.uniform2f(loc.u_size, this.w, this.h);
+                    gl.uniform2f(loc.u_csize, this.cPrep.w, this.cPrep.h);
+                });
+                upscaleInputs = [['u_pred', this.cPred.tex, false]];
+            }
 
             this.pass(this.prog(legacy ? 'legacyC' : 'nextC'), this.cDelta,
                       debandInputs(this.cPrep), (loc) => setDeband(loc, this.cPrep, 128 / 255));
 
-            this.pass(this.prog(legacy ? 'legacyFinal' : 'nextFinal'), null, [
+            this.pass(this.prog((legacy ? 'legacyFinal' : 'nextFinal') + FINAL_CHROMA[this.chroma]), null, [
                 ...debandInputs(this.yPrep),
                 ['u_c', this.cDelta.tex, linear],
                 ['u_src', this.src, false],
+                ...upscaleInputs,
             ], (loc) => {
                 setDeband(loc, this.yPrep, 16 / 255);
                 setOutput(loc);
@@ -1271,7 +1544,8 @@ void main() {
     }
 
     // Accepts mpv.conf lines or command line flags, e.g.
-    // "deband-iterations=2" or "--deband-threshold=35 --deband-grain=16"
+    // "deband-iterations=2" or "--deband-threshold=35 --deband-grain=16".
+    // A line loading either CfL shader picks that chroma upscaling.
     function parseMpvOptions(text) {
         const re = /(?:--)?deband-(iterations|threshold|range|grain)\s*=\s*(-?[\d.]+)/g;
         let m, n = 0;
@@ -1281,6 +1555,11 @@ void main() {
             if (m[1] === 'iterations')
                 v = Math.round(v);
             settings[m[1]] = v;
+            n++;
+        }
+        const shader = /(?:^|\s)(?:--)?glsl-shaders?(?:-append)?\s*=.*CfL_Prediction(_Lite)?\.glsl/i.exec(text);
+        if (shader) {
+            settings.chroma = shader[1] ? 'cfl-lite' : 'cfl';
             n++;
         }
         if (/(?:^|\s)(?:--)?deband\s*=\s*no\b/.test(text))
@@ -1411,6 +1690,11 @@ void main() {
                 ['fast', 'Fast', 'For weak GPUs: gpu-next in a single pass, a fraction of the GPU work, nearly the same result.'],
             ]),
             preset: presetPicker(),
+            chroma: choice('chroma', [
+                ['browser', 'Browser', 'The browser\'s own chroma upscaling, usually bilinear: color bleeds a little over sharp edges.'],
+                ['cfl', 'CfL', 'Chroma from Luma prediction: sharper color edges, as with mpv\'s CfL_Prediction.glsl. Not in Fast mode.'],
+                ['cfl-lite', 'CfL Lite', 'CfL_Prediction_Lite.glsl: fewer samples and no smoothing pass. A bit cheaper. Not in Fast mode.'],
+            ]),
             iterations: number('iterations', 1),
             threshold: number('threshold', 1),
             range: number('range', 1),
@@ -1487,6 +1771,7 @@ void main() {
                     refreshPanel();
                     requestRender();
                 })),
+            section('Chroma upscaling', inputs.chroma),
             row('Matrix', inputs.matrix, 'YCbCr matrix the browser used to convert the video to RGB'),
             row('Snap luma', inputs.snap, 'Round recovered luma to the 8-bit code grid, undoing the browser\'s RGB rounding (not in Fast)'),
             row('Dither', inputs.dither, 'Dither output to 8 bits (mpv dithers by default)'),

@@ -18,6 +18,10 @@ conversion: the script undoes the browser's YCbCr→RGB conversion, rebuilds the
 planes, debands each one, converts back and draws on a canvas laid over the
 `<video>`. Runs on WebGL2, with a WebGL1 fallback (e.g. Tor/Mullvad Browser).
 
+It can also replace the browser's chroma upscaling with a port of
+[GLSL Chroma from Luma (CfL) Prediction](https://github.com/Artoriuz/glsl-chroma-from-luma-prediction)
+(see [Chroma upscaling](#chroma-upscaling)).
+
 ## Comparison
 
 YouTube's 720p stream of Sintel at 0:35, default settings. Left half is the
@@ -61,13 +65,14 @@ out to be a few flat blocks of brightness:
 
 Both hotkeys can be re-recorded in the panel.
 
-| Setting    | Default    | mpv option            |
-|------------|------------|-----------------------|
-| Mode       | `gpu-next` | `--vo`                |
-| Iterations | 1          | `--deband-iterations` |
-| Threshold  | 48         | `--deband-threshold`  |
-| Range      | 16         | `--deband-range`      |
-| Grain      | 32         | `--deband-grain`      |
+| Setting          | Default    | mpv option                           |
+|------------------|------------|--------------------------------------|
+| Mode             | `gpu-next` | `--vo`                               |
+| Iterations       | 1          | `--deband-iterations`                |
+| Threshold        | 48         | `--deband-threshold`                 |
+| Range            | 16         | `--deband-range`                     |
+| Grain            | 32         | `--deband-grain`                     |
+| Chroma upscaling | Browser    | `--glsl-shaders=CfL_Prediction.glsl` |
 
 The panel also has the YCbCr matrix (709/601), luma snapping, output dithering,
 upload precision, WebGL backend and a split-screen comparison view.
@@ -91,6 +96,33 @@ type a name under them and click **Save**. Saving under a name you already
 used updates that preset, and **Delete** next to the list removes the selected
 one. When the values match no preset, the list shows **Custom**. **Reset**
 doesn't remove your presets.
+
+### Chroma upscaling
+
+YouTube video stores color (chroma) at half the resolution of brightness
+(luma), and browsers upscale it bilinearly, so color bleeds a pixel or two
+over sharp edges, most visibly red and blue on dark backgrounds. Under
+**Chroma upscaling** in the panel, **CfL** and **CfL Lite** replace that with
+ports of `CfL_Prediction.glsl` and `CfL_Prediction_Lite.glsl` from
+[GLSL Chroma from Luma (CfL) Prediction](https://github.com/Artoriuz/glsl-chroma-from-luma-prediction)
+by João Chrisóstomo, the shaders mpv users load with `--glsl-shaders`. They
+predict each pixel's color from its full resolution luma with least squares
+fits over the chroma pixels around it, and fall back to a plain interpolation
+where luma and chroma don't correlate. CfL Lite takes fewer samples and skips
+the final smoothing pass.
+
+- They work with gpu-next and gpu, not Fast. On a GeForce RTX 3060 at 1080p,
+  where gpu-next debanding takes about 0.16 ms of GPU time per frame, CfL
+  adds about 0.5 ms and CfL Lite about 0.4 ms.
+- They start from the chroma plane the script rebuilds from the browser's
+  RGB, which has already been through the browser's bilinear upscaling, so
+  edges come out sharper than the browser's but a little softer than mpv's
+  on the original file.
+- mpv runs CfL on the debanded planes. Here it runs on the planes before
+  debanding and the deband change is added on top, which saves debanding luma
+  into a render target first.
+- Pasting an mpv.conf line that loads either shader into **mpv options**
+  picks it.
 
 ## Weak hardware
 
@@ -151,4 +183,5 @@ colors. 4K and higher work, but the cost grows with resolution.
 ## License
 
 LGPL-2.1-or-later, matching libplacebo and mpv, whose shaders this ports.
-See [LICENSE](LICENSE).
+See [LICENSE](LICENSE). The CfL shaders are ported from MIT licensed code,
+whose notice is kept with the port in the script.
