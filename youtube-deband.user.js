@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube Deband (mpv / libplacebo)
 // @namespace    youtube-deband
-// @version      1.5.1
+// @version      1.6.0
 // @description  Debands YouTube video in WebGL2 using a port of mpv's deband shaders (vo=gpu-next / libplacebo and legacy vo=gpu), with mpv's parameters.
 // @match        *://*.youtube.com/*
 // @match        *://www.youtube-nocookie.com/*
@@ -21,9 +21,10 @@
  * mpv debands the decoded planes (Y and the subsampled CbCr) before any color
  * conversion. A browser only hands out RGB, so this script reverses the
  * browser's YCbCr->RGB conversion, rebuilds a full-res Y plane and a half-res
- * CbCr plane, debands each plane in its own pass exactly like mpv does (so the
- * chroma radius is in chroma pixels and the PRNG is seeded per plane pixel),
- * then converts back to RGB and draws onto a canvas laid over the <video>.
+ * CbCr plane, debands each plane at its own resolution exactly like mpv does
+ * (so the chroma radius is in chroma pixels and the PRNG is seeded per plane
+ * pixel), then converts back to RGB and draws onto a canvas laid over the
+ * <video>. Luma is debanded inside that final pass to save a render target.
  *
  * Shaders:
  *   gpu-next: libplacebo src/shaders/sampling.c pl_shader_deband() with
@@ -66,7 +67,7 @@
     const MATRICES = { '709': [0.2126, 0.0722], '601': [0.299, 0.114] };
 
     const settings = loadSettings();
-    console.info(`[yt-deband] 1.5.1 running; ${settings.hotkeyPanel} or the DB player button opens the settings`);
+    console.info(`[yt-deband] 1.6.0 running; ${settings.hotkeyPanel} or the DB player button opens the settings`);
 
     function loadSettings() {
         try {
@@ -138,6 +139,12 @@ vec2 loadPlane(sampler2D t, vec2 uv) {
     return c.rg;
 #endif
 }
+// Packed planes can't hold negative values, so changes are stored offset
+#ifdef PACKED
+#define DELTA_BIAS 0.5
+#else
+#define DELTA_BIAS 0.0
+#endif
 // Bilinear sampling, done by hand when the plane is packed
 vec2 loadPlaneLinear(sampler2D t, vec2 uv, vec2 size) {
 #ifdef PACKED
@@ -164,11 +171,12 @@ vec3 rgb2ycc(vec3 c) {
                 128.0 + 224.0 * (c.b - y) / (2.0 - 2.0 * kb),
                 128.0 + 224.0 * (c.r - y) / (2.0 - 2.0 * kr)) / 255.0;
 }
-vec3 ycc2rgb(vec3 c) {
+// RGB change for a YCbCr change (the linear part of YCbCr -> RGB)
+vec3 dycc2rgb(vec3 d) {
     float kr = u_k.x, kb = u_k.y, kg = 1.0 - kr - kb;
-    float y  = (c.x * 255.0 - 16.0)  / 219.0;
-    float cb = (c.y * 255.0 - 128.0) / 224.0;
-    float cr = (c.z * 255.0 - 128.0) / 224.0;
+    float y  = d.x * 255.0 / 219.0;
+    float cb = d.y * 255.0 / 224.0;
+    float cr = d.z * 255.0 / 224.0;
     float r = y + (2.0 - 2.0 * kr) * cr;
     float b = y + (2.0 - 2.0 * kb) * cb;
     return vec3(r, (y - kr * r - kb * b) / kg, b);
@@ -186,20 +194,15 @@ void main() {
     FRAG = storePlane(vec2(y, 0.0));
 }`;
 
-    // Half resolution (4:2:0) chroma plane, center sited
+    // Half resolution (4:2:0) chroma plane, center sited: the average of each
+    // 2x2 block. YCbCr is linear in RGB, so one bilinear fetch from the
+    // block's middle averages it (clamping to the edge for odd sizes).
     const FS_PREP_C = YCC + `
 uniform sampler2D u_src;
 uniform vec2 u_srcSize;
 void main() {
-    vec2 base = floor(gl_FragCoord.xy) * 2.0;
-    vec2 c = vec2(0.0);
-    for (int j = 0; j < 2; j++) {
-        for (int i = 0; i < 2; i++) {
-            vec2 p = min(base + vec2(float(i), float(j)), u_srcSize - 1.0);
-            c += rgb2ycc(TEX(u_src, (p + 0.5) / u_srcSize).rgb).yz;
-        }
-    }
-    FRAG = storePlane(c * 0.25);
+    vec2 mid = floor(gl_FragCoord.xy) * 2.0 + 1.0;
+    FRAG = storePlane(rgb2ycc(TEX(u_src, mid / u_srcSize).rgb).yz);
 }`;
 
     // libplacebo sh_prng(): pcg3d (http://jcgt.org/published/0009/03/02/),
@@ -275,8 +278,9 @@ vec3 prng(inout vec4 x, inout vec4 y, inout vec4 z) {
 #endif
 `;
 
-    // libplacebo pl_shader_deband(), NC = number of plane components
-    const fsNext = (nc) => `
+    // libplacebo pl_shader_deband() on the plane pixel px, NC = number of
+    // plane components. Returns the change it makes to the pixel.
+    const debandNext = (nc) => `
 #define NC ${nc}
 #if NC == 1
 #define T float
@@ -294,14 +298,15 @@ uniform int u_iter;
 uniform float u_radius, u_threshold, u_grain;
 uniform vec2 u_neutral;
 ${PRNG}
-void main() {
+T deband(vec2 px) {
     vec2 pt = 1.0 / u_texSize;
-    vec2 pos = gl_FragCoord.xy * pt;
+    vec2 pos = (px + 0.5) * pt;
     PRNG_STATE;
-    PRNG_INIT(floor(gl_FragCoord.xy), u_frame);
+    PRNG_INIT(px, u_frame);
 #define GET(X, Y) (loadPlane(u_tex, pos + pt * vec2(X, Y)).SW)
     T avg, diff, bound;
-    T res = GET(0.0, 0.0);
+    T orig = GET(0.0, 0.0);
+    T res = orig;
     vec2 d;
 
     // For each iteration, compute the average at a given distance and
@@ -329,17 +334,13 @@ void main() {
         T strength = min(abs(res - bound), T(u_grain));
         res += strength * (T(RAND) - T(0.5));
     }
-
-#if NC == 1
-    FRAG = storePlane(vec2(res, 0.0));
-#else
-    FRAG = storePlane(res);
-#endif
+    return res - orig;
 }`;
 
-    // mpv vo=gpu pass_sample_deband(). mpv works on vec4s; only the plane's
-    // own components matter, so this uses vec2.
-    const FS_LEGACY = `
+    // mpv vo=gpu pass_sample_deband() on the plane pixel px. mpv works on
+    // vec4s; only the plane's own components matter, so this uses vec2.
+    // Returns the change it makes to the pixel.
+    const DEBAND_LEGACY = `
 uniform sampler2D u_tex;
 uniform vec2 u_texSize;
 uniform float u_random;
@@ -365,13 +366,14 @@ vec2 average(float range, inout float h) {
     return (ref0 + ref1 + ref2 + ref3)*0.25;
 }
 
-void main() {
+vec2 deband(vec2 px) {
     pt = 1.0 / u_texSize;
-    pos = gl_FragCoord.xy * pt;
+    pos = (px + 0.5) * pt;
     vec3 _m = vec3(pos, u_random) + vec3(1.0);
     float h = permute(permute(permute(_m.x)+_m.y)+_m.z);
 
-    vec2 color = loadPlaneLinear(u_tex, pos, u_texSize);
+    vec2 orig = loadPlaneLinear(u_tex, pos, u_texSize);
+    vec2 color = orig;
     vec2 avg, diff;
     for (int i = 1; i <= 16; i++) {
         if (i > u_iter)
@@ -386,15 +388,23 @@ void main() {
     noise.y = rand(h); h = permute(h);
     noise.z = rand(h); h = permute(h);
     color += u_gain * (noise.xy - vec2(0.5));
-    FRAG = storePlane(color);
+    return color - orig;
 }`;
 
-    // Recombine planes, convert to RGB, dither, flip onto the canvas. Only the
-    // change made by debanding is added on top of the source pixel, so the
-    // lossy RGB -> 4:2:0 -> RGB round trip never shows up where nothing was
-    // debanded (e.g. sharp colored edges).
-    const FS_FINAL = YCC + `
-uniform sampler2D u_y, u_c, u_y0, u_c0, u_src;
+    // Chroma pass: stores the change debanding makes to each chroma pixel
+    const fsChroma = (deband) => deband + `
+void main() {
+    FRAG = storePlane(deband(floor(gl_FragCoord.xy)) + DELTA_BIAS);
+}`;
+
+    // Deband luma at this pixel (the luma pass is folded in here, saving a
+    // full resolution render target), add the chroma change, convert the
+    // change to RGB, dither, flip onto the canvas. Only the change is added on
+    // top of the source pixel, so the lossy RGB -> 4:2:0 -> RGB round trip
+    // never shows up where nothing was debanded (e.g. sharp colored edges).
+    // lumaDelta is the expression for the luma change at plane pixel p.
+    const fsFinal = (deband, lumaDelta) => YCC + deband + `
+uniform sampler2D u_c, u_src;
 uniform vec2 u_size, u_csize;
 uniform bool u_dither;
 uniform float u_split;
@@ -404,9 +414,8 @@ void main() {
     vec3 rgb = TEX(u_src, uv).rgb;
     if (p.x >= u_split * u_size.x) {
         vec2 cuv = (p + 0.5) / (2.0 * u_csize);
-        vec3 after  = vec3(loadPlane(u_y,  uv).x, loadPlaneLinear(u_c,  cuv, u_csize));
-        vec3 before = vec3(loadPlane(u_y0, uv).x, loadPlaneLinear(u_c0, cuv, u_csize));
-        rgb += ycc2rgb(after) - ycc2rgb(before);
+        vec2 dc = loadPlaneLinear(u_c, cuv, u_csize) - DELTA_BIAS;
+        rgb += dycc2rgb(vec3(${lumaDelta}, dc));
     }
     if (u_dither) {
         float n = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
@@ -472,10 +481,10 @@ void main() {
             this.progs = {
                 prepY: this.program(vs, header + FS_PREP_Y),
                 prepC: this.program(vs, header + FS_PREP_C),
-                nextY: this.program(vs, header + fsNext(1)),
-                nextC: this.program(vs, header + fsNext(2)),
-                legacy: this.program(vs, header + FS_LEGACY),
-                final: this.program(vs, header + FS_FINAL),
+                nextC: this.program(vs, header + fsChroma(debandNext(2))),
+                nextFinal: this.program(vs, header + fsFinal(debandNext(1), 'deband(p)')),
+                legacyC: this.program(vs, header + fsChroma(DEBAND_LEGACY)),
+                legacyFinal: this.program(vs, header + fsFinal(DEBAND_LEGACY, 'deband(p).x')),
             };
 
             if (!caps.uintPrng) {
@@ -574,11 +583,15 @@ void main() {
             return { tex, fbo, w, h };
         }
 
-        resize(w, h, precision) {
+        resize(w, h, s) {
             const gl = this.gl;
-            if (!this.webgl2)
-                precision = 'byte';
-            if (w === this.w && h === this.h && precision === this.uploadFormat)
+            const precision = this.webgl2 ? s.precision : 'byte';
+            // Snapped luma is exactly on the 8-bit grid, so an 8-bit plane
+            // holds it losslessly with half the memory traffic. Not for the
+            // legacy shader: it filters luma bilinearly, and 8-bit textures
+            // aren't guaranteed to filter with more than 8 bits of precision.
+            const yFormat = s.snap && s.algo !== 'gpu' ? gl.R8 : gl.R16F;
+            if (w === this.w && h === this.h && precision === this.uploadFormat && yFormat === this.yFormat)
                 return;
             for (const t of this.textures) gl.deleteTexture(t);
             for (const f of this.fbos) gl.deleteFramebuffer(f);
@@ -588,16 +601,16 @@ void main() {
             const cw = Math.ceil(w / 2), ch = Math.ceil(h / 2);
             this.src = this.texture(w, h, precision === 'half' ? gl.RGBA16F : gl.RGBA8);
             this.srcAllocated = false;
-            this.yPrep = this.target(w, h, gl.R16F);
+            this.yPrep = this.target(w, h, yFormat);
             this.cPrep = this.target(cw, ch, gl.RG16F);
-            this.yOut = this.target(w, h, gl.R16F);
-            this.cOut = this.target(cw, ch, gl.RG16F);
+            this.cDelta = this.target(cw, ch, gl.RG16F);
 
             this.canvas.width = w;
             this.canvas.height = h;
             this.w = w;
             this.h = h;
             this.uploadFormat = precision;
+            this.yFormat = yFormat;
             this.checkUpload = true;
         }
 
@@ -639,7 +652,7 @@ void main() {
 
         render(video, s) {
             const gl = this.gl;
-            this.resize(video.videoWidth, video.videoHeight, s.precision);
+            this.resize(video.videoWidth, video.videoHeight, s);
             this.upload(video);
             if (this.checkUpload) {
                 this.checkUpload = false;
@@ -669,53 +682,52 @@ void main() {
                 setSrc(loc);
                 gl.uniform1i(loc.u_snap, s.snap ? 1 : 0);
             });
-            this.pass(this.progs.prepC, this.cPrep, [['u_src', this.src, false]], setSrc);
+            // The 2x2 average needs bilinear filtering of the source
+            this.pass(this.progs.prepC, this.cPrep, [['u_src', this.src, true]], setSrc);
 
             this.frame = (this.frame + 1) % 16777216;
-            const planes = [[this.yPrep, this.yOut, 16 / 255], [this.cPrep, this.cOut, 128 / 255]];
-            if (s.algo === 'gpu') {
-                const random = Math.random();
-                for (const [inp, out] of planes) {
-                    this.pass(this.progs.legacy, out, [['u_tex', inp.tex, linear]], (loc) => {
-                        gl.uniform2f(loc.u_texSize, inp.w, inp.h);
-                        gl.uniform1f(loc.u_random, random);
-                        gl.uniform1i(loc.u_iter, s.iterations);
-                        gl.uniform1f(loc.u_range, s.range);
-                        gl.uniform1f(loc.u_threshold, s.threshold);
-                        gl.uniform1f(loc.u_gain, s.grain / 8192.0);
-                    });
+            const legacy = s.algo === 'gpu';
+            const random = Math.random();
+            // Inputs and uniforms of the deband code for a plane
+            const debandInputs = (plane) => {
+                // The legacy shader samples bilinearly, gpu-next the nearest pixel
+                const inputs = [['u_tex', plane.tex, legacy && linear]];
+                if (this.xorLut && !legacy)
+                    inputs.push(['u_xor', this.xorLut, false]);
+                return inputs;
+            };
+            const setDeband = (loc, plane, neutral) => {
+                gl.uniform2f(loc.u_texSize, plane.w, plane.h);
+                gl.uniform1i(loc.u_iter, s.iterations);
+                if (legacy) {
+                    gl.uniform1f(loc.u_random, random);
+                    gl.uniform1f(loc.u_range, s.range);
+                    gl.uniform1f(loc.u_threshold, s.threshold);
+                    gl.uniform1f(loc.u_gain, s.grain / 8192.0);
+                } else {
+                    // Option mapping from mpv's vo_gpu_next.c, then the /1000
+                    // (8-bit sources have a normalization scale of 1) from
+                    // libplacebo's pl_shader_deband()
+                    gl.uniform1f(loc.u_frame, this.frame);
+                    gl.uniform1f(loc.u_radius, s.range);
+                    gl.uniform1f(loc.u_threshold, s.threshold / 16.384 / 1000);
+                    gl.uniform1f(loc.u_grain, s.grain / 8.192 / 1000);
+                    gl.uniform2f(loc.u_neutral, neutral, neutral);
                 }
-            } else {
-                // Option mapping from mpv's vo_gpu_next.c, then the /1000
-                // (8-bit sources have a normalization scale of 1) from
-                // libplacebo's pl_shader_deband()
-                planes.forEach(([inp, out, neutral], i) => {
-                    const prog = i === 0 ? this.progs.nextY : this.progs.nextC;
-                    const inputs = [['u_tex', inp.tex, false]];
-                    if (this.xorLut)
-                        inputs.push(['u_xor', this.xorLut, false]);
-                    this.pass(prog, out, inputs, (loc) => {
-                        gl.uniform2f(loc.u_texSize, inp.w, inp.h);
-                        gl.uniform1f(loc.u_frame, this.frame);
-                        gl.uniform1i(loc.u_iter, s.iterations);
-                        gl.uniform1f(loc.u_radius, s.range);
-                        gl.uniform1f(loc.u_threshold, s.threshold / 16.384 / 1000);
-                        gl.uniform1f(loc.u_grain, s.grain / 8.192 / 1000);
-                        gl.uniform2f(loc.u_neutral, neutral, neutral);
-                    });
-                });
-            }
+            };
 
-            this.pass(this.progs.final, null, [
-                ['u_y', this.yOut.tex, false],
-                ['u_c', this.cOut.tex, linear],
-                ['u_y0', this.yPrep.tex, false],
-                ['u_c0', this.cPrep.tex, linear],
+            this.pass(legacy ? this.progs.legacyC : this.progs.nextC, this.cDelta,
+                      debandInputs(this.cPrep), (loc) => setDeband(loc, this.cPrep, 128 / 255));
+
+            this.pass(legacy ? this.progs.legacyFinal : this.progs.nextFinal, null, [
+                ...debandInputs(this.yPrep),
+                ['u_c', this.cDelta.tex, linear],
                 ['u_src', this.src, false],
             ], (loc) => {
+                setDeband(loc, this.yPrep, 16 / 255);
                 gl.uniform2f(loc.u_k, k[0], k[1]);
                 gl.uniform2f(loc.u_size, this.w, this.h);
-                gl.uniform2f(loc.u_csize, this.cOut.w, this.cOut.h);
+                gl.uniform2f(loc.u_csize, this.cDelta.w, this.cDelta.h);
                 gl.uniform1i(loc.u_dither, s.dither ? 1 : 0);
                 gl.uniform1f(loc.u_split, s.split ? 0.5 : -1.0);
             });
