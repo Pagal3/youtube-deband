@@ -1,11 +1,15 @@
 # YouTube Deband
 
 A userscript that debands YouTube video in the browser using WebGL ports of
-mpv's deband shaders, with mpv's own parameters.
+[mpv](https://mpv.io/)'s deband shaders, with mpv's own parameters.
 
-- **gpu-next**: libplacebo `pl_shader_deband()` (`src/shaders/sampling.c`),
-  with mpv's option mapping from `video/out/vo_gpu_next.c`
-- **gpu**: mpv's legacy `pass_sample_deband()` (`video/out/gpu/video_shaders.c`)
+- **gpu-next**: [libplacebo](https://code.videolan.org/videolan/libplacebo)
+  `pl_shader_deband()`
+  ([`src/shaders/sampling.c`](https://code.videolan.org/videolan/libplacebo/-/blob/master/src/shaders/sampling.c)),
+  with mpv's option mapping from
+  [`video/out/vo_gpu_next.c`](https://github.com/mpv-player/mpv/blob/master/video/out/vo_gpu_next.c)
+- **gpu**: mpv's legacy `pass_sample_deband()`
+  ([`video/out/gpu/video_shaders.c`](https://github.com/mpv-player/mpv/blob/master/video/out/gpu/video_shaders.c))
 - **Fast**: gpu-next cut down to a single pass for weak GPUs (see
   [Weak hardware](#weak-hardware))
 
