@@ -68,6 +68,26 @@ Both hotkeys can be re-recorded in the panel.
 The panel also has the YCbCr matrix (709/601), luma snapping, output dithering,
 upload precision, WebGL backend and a split-screen comparison view.
 
+### Presets
+
+Pick a preset under **Preset** in the panel to set the four deband values at
+once. The mode and the other settings stay as they are.
+
+| Preset      | Iterations | Threshold | Range | Grain | For                                              |
+|-------------|------------|-----------|-------|-------|--------------------------------------------------|
+| Default     | 1          | 48        | 16    | 32    | mpv's defaults                                   |
+| Subtle      | 1          | 32        | 16    | 16    | High bitrate 1080p and up                        |
+| Animation   | 4          | 35        | 16    | 4     | Anime and cartoons, where grain shows on flat colors |
+| Strong      | 4          | 64        | 20    | 32    | Broad bands in skies, fog and gradients          |
+| Aggressive  | 4          | 100       | 8     | 32    | Hard, close-set steps like blocky dark scenes    |
+| Low bitrate | 4          | 128       | 16    | 48    | 480p and below, heavily compressed uploads       |
+
+To make your own, set the values (or paste them with **Apply mpv options**),
+type a name under them and click **Save**. Saving under a name you already
+used updates that preset, and **Delete** next to the list removes the selected
+one. When the values match no preset, the list shows **Custom**. **Reset**
+doesn't remove your presets.
+
 ## Weak hardware
 
 If video stutters with debanding on, click **Fast** under **Mode** at the top
@@ -102,8 +122,8 @@ WebGL2, and a twentieth on WebGL1.
 
 **Userscript managers:** Violentmonkey (recommended), Tampermonkey,
 Greasemonkey, FireMonkey and Userscripts for Safari. The script uses no
-`GM_*` APIs. Settings are kept in youtube.com's `localStorage`, so clearing
-YouTube's site data resets them.
+`GM_*` APIs. Settings and your presets are kept in youtube.com's
+`localStorage`, so clearing YouTube's site data resets them.
 
 **Pages:** watch pages, theater mode, fullscreen and embeds (including
 youtube-nocookie.com). YouTube Music is excluded. Shorts and m.youtube.com

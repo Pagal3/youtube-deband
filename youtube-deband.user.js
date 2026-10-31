@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube Deband (mpv / libplacebo)
 // @namespace    youtube-deband
-// @version      1.7.1
+// @version      1.8.0
 // @description  Debands YouTube video in WebGL2 using a port of mpv's deband shaders (vo=gpu-next / libplacebo and legacy vo=gpu), with mpv's parameters.
 // @match        *://*.youtube.com/*
 // @match        *://www.youtube-nocookie.com/*
@@ -41,7 +41,8 @@
     'use strict';
 
     const STORAGE_KEY = 'yt-deband-settings';
-    const VERSION = '1.7.1'; // keep in sync with @version
+    const PRESETS_KEY = 'yt-deband-presets'; // the user's own presets, apart so Reset keeps them
+    const VERSION = '1.8.0'; // keep in sync with @version
 
     // Option ranges match mpv's deband_conf (video/out/gpu/video_shaders.c)
     const DEFAULTS = {
@@ -51,6 +52,7 @@
         threshold: 48,      // --deband-threshold=<0..4096>
         range: 16,          // --deband-range=<1..64>
         grain: 32,          // --deband-grain=<0..4096>
+        preset: 'Default',  // preset picked last, shown while the four values above still match it
         matrix: '709',      // YCbCr matrix the browser used to make RGB
         snap: true,         // round the recovered luma to the 8-bit code grid
         dither: true,       // dither the output down to 8 bits like mpv does
@@ -68,7 +70,25 @@
     };
     const MATRICES = { '709': [0.2126, 0.0722], '601': [0.299, 0.114] };
 
+    // A preset sets the four deband parameters; the mode and the rest stay
+    const PRESET_KEYS = ['iterations', 'threshold', 'range', 'grain'];
+    const FACTORY_PRESETS = [
+        { name: 'Default', iterations: 1, threshold: 48, range: 16, grain: 32,
+          about: 'mpv\'s defaults: a light touch that keeps fine detail.' },
+        { name: 'Subtle', iterations: 1, threshold: 32, range: 16, grain: 16,
+          about: 'Only the faintest steps, with little grain. For high bitrate 1080p and up.' },
+        { name: 'Animation', iterations: 4, threshold: 35, range: 16, grain: 4,
+          about: 'Four gentle passes and almost no grain, which would show on the flat colors of anime and cartoons.' },
+        { name: 'Strong', iterations: 4, threshold: 64, range: 20, grain: 32,
+          about: 'Four wide passes: smooths broad bands in skies, fog and gradients.' },
+        { name: 'Aggressive', iterations: 4, threshold: 100, range: 8, grain: 32,
+          about: 'A high threshold over a short reach: flattens hard, close-set steps like blocky dark scenes. Softens fine texture.' },
+        { name: 'Low bitrate', iterations: 4, threshold: 128, range: 16, grain: 48,
+          about: 'For 480p and below or heavily compressed uploads: smooths hard and adds grain to hide the rest. Loses fine texture.' },
+    ];
+
     const settings = loadSettings();
+    let customPresets = loadPresets();
     console.info(`[yt-deband] ${VERSION} running; ${settings.hotkeyPanel} or the DB player button opens the settings`);
 
     function loadSettings() {
@@ -85,6 +105,31 @@
             localStorage.setItem(STORAGE_KEY, JSON.stringify(settings));
         } catch (e) { /* storage blocked, keep in memory */ }
     }
+
+    // The user's presets: [{ name, iterations, threshold, range, grain }]
+    function loadPresets() {
+        try {
+            const saved = JSON.parse(localStorage.getItem(PRESETS_KEY) || '[]');
+            return saved.filter((p) => p && typeof p.name === 'string' &&
+                                       PRESET_KEYS.every((k) => typeof p[k] === 'number'));
+        } catch (e) {
+            return [];
+        }
+    }
+
+    function savePresets() {
+        try {
+            localStorage.setItem(PRESETS_KEY, JSON.stringify(customPresets));
+        } catch (e) { /* storage blocked, keep in memory */ }
+    }
+
+    // Pick up presets saved or deleted in another tab
+    window.addEventListener('storage', (e) => {
+        if (e.key === PRESETS_KEY) {
+            customPresets = loadPresets();
+            refreshPanel();
+        }
+    });
 
     // ------------------------------------------------------------------
     // Shaders
@@ -1175,13 +1220,54 @@ void main() {
     }
 
     function applySetting(key, value) {
-        settings[key] = value;
+        applySettings({ [key]: value });
+    }
+
+    function applySettings(values) {
+        Object.assign(settings, values);
         saveSettings();
         refreshPanel();
         // A canvas keeps its first context type, so a backend switch needs a new one
-        if (key === 'backend' && video)
+        if ('backend' in values && video)
             attach(video);
         requestRender();
+    }
+
+    const presetValues = (s) => Object.fromEntries(PRESET_KEYS.map((k) => [k, s[k]]));
+    const sameName = (a, b) => a.toLowerCase() === b.toLowerCase();
+
+    // The preset the deband parameters come from: the one picked last while
+    // they still match it, otherwise the first that matches, or null
+    function activePreset() {
+        const all = FACTORY_PRESETS.concat(customPresets);
+        const matches = (p) => PRESET_KEYS.every((k) => p[k] === settings[k]);
+        return all.find((p) => p.name === settings.preset && matches(p)) || all.find(matches) || null;
+    }
+
+    function applyPreset(name) {
+        const p = FACTORY_PRESETS.concat(customPresets).find((q) => q.name === name);
+        if (p)
+            applySettings(Object.assign({ preset: p.name }, presetValues(p)));
+    }
+
+    // Saves the current deband parameters as one of the user's presets,
+    // replacing theirs with the same name in any case. Returns whether it did.
+    function savePreset(name) {
+        const preset = Object.assign({ name }, presetValues(settings));
+        const i = customPresets.findIndex((p) => sameName(p.name, name));
+        if (i >= 0)
+            customPresets[i] = preset;
+        else
+            customPresets.push(preset);
+        savePresets();
+        applySettings({ preset: name });
+        return i >= 0;
+    }
+
+    function deletePreset(name) {
+        customPresets = customPresets.filter((p) => p.name !== name);
+        savePresets();
+        refreshPanel();
     }
 
     // Accepts mpv.conf lines or command line flags, e.g.
@@ -1276,6 +1362,46 @@ void main() {
             });
             return root;
         };
+        const button = (text, onclick) => el('button', {
+            textContent: text, onclick,
+            style: { background: '#333', color: '#eee', border: '1px solid #555', borderRadius: '4px', padding: '4px 10px', cursor: 'pointer', font: 'inherit' },
+        });
+        // The preset list, with Delete for the user's own presets and what the
+        // picked one is for written underneath. Values that match no preset
+        // show as Custom.
+        const presetPicker = () => {
+            const select = el('select', {
+                style: Object.assign({}, inputStyle, { flex: '1', minWidth: '0' }),
+                onchange: (e) => applyPreset(e.target.value),
+            });
+            const del = button('Delete', () => {
+                const active = activePreset();
+                if (customPresets.includes(active)) {
+                    deletePreset(active.name);
+                    setStatus(`Deleted preset ${active.name}`);
+                }
+            });
+            del.title = 'Delete the selected preset (only your own)';
+            const about = el('div', { style: { opacity: '0.7', fontSize: '11px', marginTop: '4px', minHeight: '2.8em' } });
+            const root = el('div', null, el('div', { style: { display: 'flex', gap: '8px' } }, select, del), about);
+            root.refresh = () => {
+                const active = activePreset();
+                const own = customPresets.includes(active);
+                const option = (p) => el('option', { value: p.name, textContent: p.name });
+                select.replaceChildren(
+                    el('option', { value: '', textContent: 'Custom', hidden: true, disabled: true }),
+                    el('optgroup', { label: 'Built-in' }, ...FACTORY_PRESETS.map(option)),
+                    ...(customPresets.length ? [el('optgroup', { label: 'Yours' }, ...customPresets.map(option))] : []));
+                select.value = active ? active.name : '';
+                about.textContent = !active ? 'These values aren\'t a preset. Type a name below and click Save to keep them.'
+                    : own ? 'One of your presets.' : active.about;
+                del.disabled = !own;
+                Object.assign(del.style, { opacity: own ? '' : '0.4', cursor: own ? 'pointer' : 'default' });
+            };
+            return root;
+        };
+        const section = (title, content) => el('div', { style: { margin: '10px 0 6px' } },
+            el('div', { textContent: title, style: { marginBottom: '4px' } }), content);
 
         const inputs = {
             enabled: check('enabled'),
@@ -1284,6 +1410,7 @@ void main() {
                 ['gpu', 'gpu', 'mpv\'s older vo=gpu debanding shader.'],
                 ['fast', 'Fast', 'For weak GPUs: gpu-next in a single pass, a fraction of the GPU work, nearly the same result.'],
             ]),
+            preset: presetPicker(),
             iterations: number('iterations', 1),
             threshold: number('threshold', 1),
             range: number('range', 1),
@@ -1302,15 +1429,32 @@ void main() {
             rows: 2, placeholder: 'Paste from mpv.conf, e.g.\ndeband-iterations=2', style: Object.assign({}, inputStyle, { resize: 'vertical' }),
         });
         const statusEl = el('div', { style: { opacity: '0.7', fontSize: '11px', marginTop: '8px' }, textContent: status });
-        const button = (text, onclick) => el('button', {
-            textContent: text, onclick,
-            style: { background: '#333', color: '#eee', border: '1px solid #555', borderRadius: '4px', padding: '4px 10px', cursor: 'pointer', font: 'inherit' },
+        const presetName = el('input', {
+            type: 'text', maxLength: 40, placeholder: 'Preset name',
+            style: Object.assign({}, inputStyle, { flex: '1', minWidth: '0' }),
+            onkeydown: (e) => {
+                if (e.key === 'Enter')
+                    saveAsPreset();
+            },
         });
+        const saveAsPreset = () => {
+            const name = presetName.value.trim();
+            if (!name)
+                return setStatus('Type a name for the preset first');
+            if (FACTORY_PRESETS.some((p) => sameName(p.name, name)))
+                return setStatus(`${name} is a built-in preset; pick another name`);
+            const replaced = savePreset(name);
+            presetName.value = '';
+            setStatus(`${replaced ? 'Updated' : 'Saved'} preset ${name}`);
+        };
+        const saveButton = button('Save', saveAsPreset);
+        saveButton.title = 'Save the four values above as a preset; an existing name of yours is updated';
 
         const root = el('div', {
             className: 'yt-deband-panel',
             style: {
                 position: 'fixed', top: '72px', right: '16px', zIndex: '2147483647', width: '320px',
+                maxHeight: 'calc(100vh - 114px)', overflowY: 'auto', // ends 16px above the bottom
                 background: 'rgba(20,20,20,0.96)', color: '#eee', border: '1px solid #444', borderRadius: '8px',
                 padding: '12px 14px', font: '13px/1.4 system-ui, sans-serif', boxShadow: '0 4px 24px rgba(0,0,0,0.5)',
                 display: 'none',
@@ -1324,11 +1468,13 @@ void main() {
                     el('span', { textContent: ' v' + VERSION, style: { opacity: '0.6', fontSize: '11px' } })),
                 button('×', () => togglePanel(false))),
             row('Enabled', inputs.enabled),
-            el('div', { style: { margin: '10px 0 6px' } }, el('div', { textContent: 'Mode', style: { marginBottom: '4px' } }), inputs.algo),
+            section('Mode', inputs.algo),
+            section('Preset', inputs.preset),
             row('iterations', inputs.iterations, '--deband-iterations=<0..16> (default 1)'),
             row('threshold', inputs.threshold, '--deband-threshold=<0..4096> (default 48)'),
             row('range', inputs.range, '--deband-range=<1..64> (default 16)'),
             row('grain', inputs.grain, '--deband-grain=<0..4096> (default 32)'),
+            el('div', { style: { display: 'flex', gap: '8px', margin: '6px 0 10px' } }, presetName, saveButton),
             row('mpv options', mpvText),
             el('div', { style: { display: 'flex', gap: '8px', margin: '6px 0 10px' } },
                 button('Apply mpv options', () => {
