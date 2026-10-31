@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube Deband (mpv / libplacebo)
 // @namespace    youtube-deband
-// @version      1.7.0
+// @version      1.7.1
 // @description  Debands YouTube video in WebGL2 using a port of mpv's deband shaders (vo=gpu-next / libplacebo and legacy vo=gpu), with mpv's parameters.
 // @match        *://*.youtube.com/*
 // @match        *://www.youtube-nocookie.com/*
@@ -41,6 +41,7 @@
     'use strict';
 
     const STORAGE_KEY = 'yt-deband-settings';
+    const VERSION = '1.7.1'; // keep in sync with @version
 
     // Option ranges match mpv's deband_conf (video/out/gpu/video_shaders.c)
     const DEFAULTS = {
@@ -68,7 +69,7 @@
     const MATRICES = { '709': [0.2126, 0.0722], '601': [0.299, 0.114] };
 
     const settings = loadSettings();
-    console.info(`[yt-deband] 1.7.0 running; ${settings.hotkeyPanel} or the DB player button opens the settings`);
+    console.info(`[yt-deband] ${VERSION} running; ${settings.hotkeyPanel} or the DB player button opens the settings`);
 
     function loadSettings() {
         try {
@@ -832,6 +833,8 @@ void main() {
     let boxObservers = [];
     // Render per animation frame instead of per video frame callback
     let perDisplayFrame = false;
+    // Video frame callbacks are available and watched for throttling
+    let watchFrames = false;
     let lastPresented = -1;
 
     // Fingerprinting protection (Tor/Mullvad Browser) rounds timers to whole
@@ -850,7 +853,11 @@ void main() {
         }
         return steps.length > 0 && steps.every((d) => d >= 10);
     })();
-    let recentSkips = []; // per callback: whether presentedFrames skipped ahead
+    // Video frame callbacks in the current second and how many saw
+    // presentedFrames skip ahead, and seconds in a row that called for the
+    // other render mode
+    let frameWindow = { since: -1, callbacks: 0, skips: 0 };
+    let modeStreak = 0;
     let status = '';
     // Render rate and CPU time, summarized once a second in the panel
     const stats = { count: 0, cpu: 0, since: performance.now() };
@@ -904,9 +911,11 @@ void main() {
         const style = new MutationObserver(syncBox);
         style.observe(v, { attributes: true, attributeFilter: ['style', 'class'] });
         boxObservers = [resize, style];
-        perDisplayFrame = !v.requestVideoFrameCallback || coarseTimers;
+        watchFrames = !!v.requestVideoFrameCallback && !coarseTimers;
+        perDisplayFrame = !watchFrames;
         lastPresented = -1;
-        recentSkips = [];
+        frameWindow = { since: -1, callbacks: 0, skips: 0 };
+        modeStreak = 0;
         createDebander();
         schedule();
     }
@@ -943,31 +952,22 @@ void main() {
     // Fingerprinting protection (Tor/Mullvad Browser) throttles those
     // callbacks to ~20 Hz while the video keeps playing at its full rate, so
     // presentedFrames skips frames. That is detected up front from coarse
-    // timers, and as a fallback when frames are skipped often; then render
-    // on every animation frame while playing instead (each
-    // upload takes whatever frame is current). currentTime can't detect new
-    // frames either, as it is rounded the same way.
+    // timers; then render on every animation frame while playing instead
+    // (each upload takes whatever frame is current). currentTime can't detect
+    // new frames either, as it is rounded the same way.
+    //
+    // As a fallback the callbacks are watched for skips, and keep being
+    // watched while rendering per display frame. Throttling skips steadily,
+    // while page loads, seeks and quality switches stall the page in bursts,
+    // so the mode only changes after 3 seconds in a row that call for it,
+    // either way. A wrong switch is costly: on a high refresh rate display it
+    // uploads and debands each video frame several times.
     function schedule() {
         if (!video)
             return;
-        if (!perDisplayFrame) {
-            frameCallbackId = video.requestVideoFrameCallback((now, meta) => {
-                frameCallbackId = null;
-                if (lastPresented >= 0) {
-                    recentSkips.push(meta.presentedFrames - lastPresented > 1);
-                    if (recentSkips.length > 30)
-                        recentSkips.shift();
-                }
-                lastPresented = meta.presentedFrames;
-                // A seek skips once; 5 of the last 30 is a steady pattern
-                if (recentSkips.filter(Boolean).length >= 5) {
-                    perDisplayFrame = true;
-                    console.info('[yt-deband] video frame callbacks are throttled; rendering per display frame');
-                }
-                draw();
-                schedule();
-            });
-        } else {
+        if (watchFrames && frameCallbackId === null)
+            frameCallbackId = video.requestVideoFrameCallback(onVideoFrame);
+        if (perDisplayFrame && rafId === null) {
             let lastTime = -1;
             const tick = () => {
                 rafId = requestAnimationFrame(tick);
@@ -978,6 +978,41 @@ void main() {
             };
             rafId = requestAnimationFrame(tick);
         }
+    }
+
+    function onVideoFrame(now, meta) {
+        frameCallbackId = null;
+        if (lastPresented >= 0) {
+            frameWindow.callbacks++;
+            if (meta.presentedFrames - lastPresented > 1)
+                frameWindow.skips++;
+        }
+        lastPresented = meta.presentedFrames;
+        if (frameWindow.since < 0)
+            frameWindow.since = now;
+        // Seconds with few callbacks (low frame rate, paused) say nothing
+        if (now - frameWindow.since >= 1000) {
+            if (frameWindow.callbacks >= 10) {
+                // At 20 Hz, 24 fps video skips in 1 callback of 5, 60 fps in all
+                const throttled = frameWindow.skips * 6 >= frameWindow.callbacks;
+                modeStreak = throttled !== perDisplayFrame ? modeStreak + 1 : 0;
+                if (modeStreak >= 3) {
+                    modeStreak = 0;
+                    perDisplayFrame = throttled;
+                    if (!throttled) {
+                        cancelAnimationFrame(rafId);
+                        rafId = null;
+                    }
+                    console.info(throttled
+                        ? '[yt-deband] video frame callbacks are throttled; rendering per display frame'
+                        : '[yt-deband] video frame callbacks keep up again; rendering per video frame');
+                }
+            }
+            frameWindow = { since: now, callbacks: 0, skips: 0 };
+        }
+        if (!perDisplayFrame)
+            draw();
+        schedule();
     }
 
     // Mirror the video element's box; YouTube positions it with inline styles
@@ -1284,7 +1319,9 @@ void main() {
             onkeydown: (e) => e.stopPropagation(),
         },
             el('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '4px' } },
-                el('strong', { textContent: 'Deband' }),
+                el('span', null,
+                    el('strong', { textContent: 'Deband' }),
+                    el('span', { textContent: ' v' + VERSION, style: { opacity: '0.6', fontSize: '11px' } })),
                 button('×', () => togglePanel(false))),
             row('Enabled', inputs.enabled),
             el('div', { style: { margin: '10px 0 6px' } }, el('div', { textContent: 'Mode', style: { marginBottom: '4px' } }), inputs.algo),
