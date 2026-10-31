@@ -6,6 +6,8 @@ mpv's deband shaders, with mpv's own parameters.
 - **gpu-next**: libplacebo `pl_shader_deband()` (`src/shaders/sampling.c`),
   with mpv's option mapping from `video/out/vo_gpu_next.c`
 - **gpu**: mpv's legacy `pass_sample_deband()` (`video/out/gpu/video_shaders.c`)
+- **Fast**: gpu-next cut down to a single pass for weak GPUs (see
+  [Weak hardware](#weak-hardware))
 
 Like mpv, it debands the Y and subsampled CbCr planes separately before color
 conversion: the script undoes the browser's YCbCr→RGB conversion, rebuilds the
@@ -57,7 +59,7 @@ Both hotkeys can be re-recorded in the panel.
 
 | Setting    | Default    | mpv option            |
 |------------|------------|-----------------------|
-| Algorithm  | `gpu-next` | `--vo`                |
+| Mode       | `gpu-next` | `--vo`                |
 | Iterations | 1          | `--deband-iterations` |
 | Threshold  | 48         | `--deband-threshold`  |
 | Range      | 16         | `--deband-range`      |
@@ -65,6 +67,26 @@ Both hotkeys can be re-recorded in the panel.
 
 The panel also has the YCbCr matrix (709/601), luma snapping, output dithering,
 upload precision, WebGL backend and a split-screen comparison view.
+
+## Weak hardware
+
+If video stutters with debanding on, click **Fast** under **Mode** at the top
+of the settings panel. It runs the gpu-next algorithm with the same
+parameters, but in one pass straight from the video frame instead of four:
+
+- no intermediate textures and no float textures or WebGL extensions
+- always uploads the frame as 8-bit RGBA, the cheapest upload
+- a cheap float hash instead of the pcg3d generator, which is slow on
+  WebGL1, where it is emulated without integers
+- shaders are only compiled for the mode in use
+
+To keep it cheap, it debands chroma at full resolution with the same samples as
+luma (gpu-next works on half-resolution chroma) and doesn't snap luma, so the
+result is close to gpu-next but not identical.
+
+On a GeForce RTX 3060 at 1080p, the debanding itself (without the frame upload
+that every mode shares) takes about a third of the GPU time of gpu-next on
+WebGL2, and a twentieth on WebGL1.
 
 ## Compatibility
 

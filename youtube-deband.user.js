@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube Deband (mpv / libplacebo)
 // @namespace    youtube-deband
-// @version      1.6.0
+// @version      1.7.0
 // @description  Debands YouTube video in WebGL2 using a port of mpv's deband shaders (vo=gpu-next / libplacebo and legacy vo=gpu), with mpv's parameters.
 // @match        *://*.youtube.com/*
 // @match        *://www.youtube-nocookie.com/*
@@ -30,6 +30,7 @@
  *   gpu-next: libplacebo src/shaders/sampling.c pl_shader_deband() with
  *             mpv's option mapping from video/out/vo_gpu_next.c
  *   gpu:      mpv video/out/gpu/video_shaders.c pass_sample_deband()
+ *   fast:     gpu-next cut down to one pass over the RGB frame, for weak GPUs
  *
  * Hotkeys (default): Ctrl+Alt+D toggles debanding, Ctrl+Alt+B opens the
  * settings panel; both can be re-recorded in the panel. The DB button in the
@@ -44,7 +45,7 @@
     // Option ranges match mpv's deband_conf (video/out/gpu/video_shaders.c)
     const DEFAULTS = {
         enabled: true,
-        algo: 'gpu-next',   // 'gpu-next' (libplacebo) | 'gpu' (legacy mpv shader)
+        algo: 'gpu-next',   // 'gpu-next' (libplacebo) | 'gpu' (legacy mpv shader) | 'fast' (single pass)
         iterations: 1,      // --deband-iterations=<0..16>
         threshold: 48,      // --deband-threshold=<0..4096>
         range: 16,          // --deband-range=<1..64>
@@ -67,7 +68,7 @@
     const MATRICES = { '709': [0.2126, 0.0722], '601': [0.299, 0.114] };
 
     const settings = loadSettings();
-    console.info(`[yt-deband] 1.6.0 running; ${settings.hotkeyPanel} or the DB player button opens the settings`);
+    console.info(`[yt-deband] 1.7.0 running; ${settings.hotkeyPanel} or the DB player button opens the settings`);
 
     function loadSettings() {
         try {
@@ -424,6 +425,75 @@ void main() {
     FRAG = vec4(clamp(rgb, 0.0, 1.0), 1.0);
 }`;
 
+    // Fast mode for weak GPUs: one pass straight from the RGB frame, with no
+    // render targets, float textures or extensions, and 1 + 4 * iterations
+    // texture fetches per pixel (the other modes make four passes). Same
+    // algorithm and parameters as gpu-next, with three shortcuts: chroma is
+    // debanded at full resolution with the same samples as luma, luma isn't
+    // snapped, and the random numbers come from a cheap float hash instead of
+    // pcg3d. YCbCr is linear in RGB, so averaging RGB averages YCbCr.
+    const FS_FAST = YCC + `
+uniform sampler2D u_src;
+uniform vec2 u_texSize;
+uniform float u_frame;
+uniform int u_iter;
+uniform float u_radius, u_threshold, u_grain;
+uniform bool u_dither;
+uniform float u_split;
+
+// A few multiply-adds and fracts: no integers (slow or missing on old GPUs
+// and WebGL1) and no trig. Inputs up to a few thousand, outputs ~9 bits.
+vec3 rand3(vec3 p) {
+    p = fract(p * vec3(0.1347, 0.1593, 0.1771) + p.yzx * vec3(0.0719, 0.0547, 0.0613));
+    p += dot(p, p.zxy + 19.19);
+    return fract((p + p.yzx) * p.zxy * 3.71);
+}
+
+void main() {
+    vec2 p = vec2(floor(gl_FragCoord.x), u_texSize.y - 1.0 - floor(gl_FragCoord.y));
+    vec2 pt = 1.0 / u_texSize;
+    vec2 pos = (p + 0.5) * pt;
+    vec3 rgb = TEX(u_src, pos).rgb;
+    if (p.x >= u_split * u_texSize.x) {
+        float seed = mod(u_frame, 256.0) * 17.0;
+        vec3 orig = rgb2ycc(rgb);
+        vec3 res = orig;
+        for (int i = 1; i <= 16; i++) {
+            if (i > u_iter)
+                break;
+            vec2 d = rand3(vec3(p, seed + float(i))).xy * vec2(float(i) * u_radius, 6.283185);
+            d = d.x * vec2(cos(d.y), sin(d.y)) * pt;
+            vec3 avg = rgb2ycc(0.25 * (TEX(u_src, pos + d).rgb +
+                                       TEX(u_src, pos + vec2(-d.x, d.y)).rgb +
+                                       TEX(u_src, pos - d).rgb +
+                                       TEX(u_src, pos + vec2(d.x, -d.y)).rgb));
+            res = mix(avg, res, vec3(greaterThan(abs(res - avg), vec3(u_threshold / float(i)))));
+        }
+        if (u_grain > 0.0) {
+            vec3 strength = min(abs(res - vec3(16.0, 128.0, 128.0) / 255.0), vec3(u_grain));
+            res += strength * (rand3(vec3(p, seed)) - 0.5);
+        }
+        rgb += dycc2rgb(res - orig);
+    }
+    if (u_dither) {
+        float n = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
+        rgb = floor(rgb * 255.0 + n) / 255.0;
+    }
+    FRAG = vec4(clamp(rgb, 0.0, 1.0), 1.0);
+}`;
+
+    // Fragment shader of each program. They are compiled on first use, so a
+    // weak GPU only compiles the mode it runs.
+    const PROGRAMS = {
+        prepY: FS_PREP_Y,
+        prepC: FS_PREP_C,
+        nextC: fsChroma(debandNext(2)),
+        nextFinal: fsFinal(debandNext(1), 'deband(p)'),
+        legacyC: fsChroma(DEBAND_LEGACY),
+        legacyFinal: fsFinal(DEBAND_LEGACY, 'deband(p).x'),
+        fast: FS_FAST,
+    };
+
     // ------------------------------------------------------------------
     // WebGL renderer
     // ------------------------------------------------------------------
@@ -436,6 +506,7 @@ void main() {
             this.w = 0;
             this.h = 0;
             this.uploadFormat = null;
+            this.fast = false;
             this.textures = [];
             this.fbos = [];
             this.init(backend);
@@ -476,16 +547,9 @@ void main() {
             }
             const caps = { webgl2, packed: this.packed, uintPrng: webgl2 };
 
-            const vs = webgl2 ? VS2 : VS1;
-            const header = fsHeader(caps);
-            this.progs = {
-                prepY: this.program(vs, header + FS_PREP_Y),
-                prepC: this.program(vs, header + FS_PREP_C),
-                nextC: this.program(vs, header + fsChroma(debandNext(2))),
-                nextFinal: this.program(vs, header + fsFinal(debandNext(1), 'deband(p)')),
-                legacyC: this.program(vs, header + fsChroma(DEBAND_LEGACY)),
-                legacyFinal: this.program(vs, header + fsFinal(DEBAND_LEGACY, 'deband(p).x')),
-            };
+            this.vs = webgl2 ? VS2 : VS1;
+            this.fsHeader = fsHeader(caps);
+            this.progs = {};
 
             if (!caps.uintPrng) {
                 const lut = new Uint8Array(256 * 256);
@@ -507,8 +571,13 @@ void main() {
         }
 
         get description() {
-            return `${this.webgl2 ? 'WebGL2' : 'WebGL1'}, ${this.packed ? 'packed 16-bit' : 'float'} planes, ` +
+            return `${this.webgl2 ? 'WebGL2' : 'WebGL1'}, ` +
+                   `${this.fast ? 'single pass' : (this.packed ? 'packed 16-bit' : 'float') + ' planes'}, ` +
                    `${this.uploadFormat === 'half' ? 'RGBA16F' : 'RGBA8'} upload`;
+        }
+
+        prog(name) {
+            return this.progs[name] || (this.progs[name] = this.program(this.vs, this.fsHeader + PROGRAMS[name]));
         }
 
         program(vsSrc, fsSrc) {
@@ -585,12 +654,15 @@ void main() {
 
         resize(w, h, s) {
             const gl = this.gl;
-            const precision = this.webgl2 ? s.precision : 'byte';
+            const fast = s.algo === 'fast';
+            // Fast mode takes the cheapest upload
+            const precision = this.webgl2 && !fast ? s.precision : 'byte';
             // Snapped luma is exactly on the 8-bit grid, so an 8-bit plane
             // holds it losslessly with half the memory traffic. Not for the
             // legacy shader: it filters luma bilinearly, and 8-bit textures
             // aren't guaranteed to filter with more than 8 bits of precision.
-            const yFormat = s.snap && s.algo !== 'gpu' ? gl.R8 : gl.R16F;
+            // Fast mode has no planes.
+            const yFormat = fast ? null : s.snap && s.algo !== 'gpu' ? gl.R8 : gl.R16F;
             if (w === this.w && h === this.h && precision === this.uploadFormat && yFormat === this.yFormat)
                 return;
             for (const t of this.textures) gl.deleteTexture(t);
@@ -601,9 +673,11 @@ void main() {
             const cw = Math.ceil(w / 2), ch = Math.ceil(h / 2);
             this.src = this.texture(w, h, precision === 'half' ? gl.RGBA16F : gl.RGBA8);
             this.srcAllocated = false;
-            this.yPrep = this.target(w, h, yFormat);
-            this.cPrep = this.target(cw, ch, gl.RG16F);
-            this.cDelta = this.target(cw, ch, gl.RG16F);
+            if (!fast) {
+                this.yPrep = this.target(w, h, yFormat);
+                this.cPrep = this.target(cw, ch, gl.RG16F);
+                this.cDelta = this.target(cw, ch, gl.RG16F);
+            }
 
             this.canvas.width = w;
             this.canvas.height = h;
@@ -611,6 +685,7 @@ void main() {
             this.h = h;
             this.uploadFormat = precision;
             this.yFormat = yFormat;
+            this.fast = fast;
             this.checkUpload = true;
         }
 
@@ -674,17 +749,6 @@ void main() {
             // Hardware filtering only works on unpacked float planes
             const linear = !this.packed;
             const k = MATRICES[s.matrix] || MATRICES['709'];
-            const setSrc = (loc) => {
-                gl.uniform2f(loc.u_k, k[0], k[1]);
-                gl.uniform2f(loc.u_srcSize, this.w, this.h);
-            };
-            this.pass(this.progs.prepY, this.yPrep, [['u_src', this.src, false]], (loc) => {
-                setSrc(loc);
-                gl.uniform1i(loc.u_snap, s.snap ? 1 : 0);
-            });
-            // The 2x2 average needs bilinear filtering of the source
-            this.pass(this.progs.prepC, this.cPrep, [['u_src', this.src, true]], setSrc);
-
             this.frame = (this.frame + 1) % 16777216;
             const legacy = s.algo === 'gpu';
             const random = Math.random();
@@ -715,21 +779,43 @@ void main() {
                     gl.uniform2f(loc.u_neutral, neutral, neutral);
                 }
             };
+            const setOutput = (loc) => {
+                gl.uniform2f(loc.u_k, k[0], k[1]);
+                gl.uniform1i(loc.u_dither, s.dither ? 1 : 0);
+                gl.uniform1f(loc.u_split, s.split ? 0.5 : -1.0);
+            };
 
-            this.pass(legacy ? this.progs.legacyC : this.progs.nextC, this.cDelta,
+            if (this.fast) {
+                this.pass(this.prog('fast'), null, [['u_src', this.src, false]], (loc) => {
+                    setDeband(loc, this, 0); // the frame is the plane; neutral is set in the shader
+                    setOutput(loc);
+                });
+                return;
+            }
+
+            const setSrc = (loc) => {
+                gl.uniform2f(loc.u_k, k[0], k[1]);
+                gl.uniform2f(loc.u_srcSize, this.w, this.h);
+            };
+            this.pass(this.prog('prepY'), this.yPrep, [['u_src', this.src, false]], (loc) => {
+                setSrc(loc);
+                gl.uniform1i(loc.u_snap, s.snap ? 1 : 0);
+            });
+            // The 2x2 average needs bilinear filtering of the source
+            this.pass(this.prog('prepC'), this.cPrep, [['u_src', this.src, true]], setSrc);
+
+            this.pass(this.prog(legacy ? 'legacyC' : 'nextC'), this.cDelta,
                       debandInputs(this.cPrep), (loc) => setDeband(loc, this.cPrep, 128 / 255));
 
-            this.pass(legacy ? this.progs.legacyFinal : this.progs.nextFinal, null, [
+            this.pass(this.prog(legacy ? 'legacyFinal' : 'nextFinal'), null, [
                 ...debandInputs(this.yPrep),
                 ['u_c', this.cDelta.tex, linear],
                 ['u_src', this.src, false],
             ], (loc) => {
                 setDeband(loc, this.yPrep, 16 / 255);
-                gl.uniform2f(loc.u_k, k[0], k[1]);
+                setOutput(loc);
                 gl.uniform2f(loc.u_size, this.w, this.h);
                 gl.uniform2f(loc.u_csize, this.cDelta.w, this.cDelta.h);
-                gl.uniform1i(loc.u_dither, s.dither ? 1 : 0);
-                gl.uniform1f(loc.u_split, s.split ? 0.5 : -1.0);
             });
         }
     }
@@ -1132,10 +1218,37 @@ void main() {
         const select = (key, options) => el('select', {
             style: inputStyle, onchange: (e) => applySetting(key, e.target.value),
         }, ...options.map(([v, t]) => el('option', { value: v, textContent: t })));
+        // A button per option, the selected one highlighted, with what it
+        // does written underneath
+        const choice = (key, options) => {
+            const buttons = options.map(([v, text, about]) => el('button', {
+                type: 'button', textContent: text, title: about,
+                style: { flex: '1', border: '1px solid #444', borderRadius: '4px', padding: '5px 4px', cursor: 'pointer', font: 'inherit' },
+                onclick: () => applySetting(key, v),
+            }));
+            const about = el('div', { style: { opacity: '0.7', fontSize: '11px', marginTop: '4px', minHeight: '2.8em' } });
+            const root = el('div', { role: 'radiogroup' },
+                el('div', { style: { display: 'flex', gap: '4px' } }, ...buttons), about);
+            root.refresh = (value) => options.forEach(([v, , text], i) => {
+                const on = v === value;
+                buttons[i].setAttribute('aria-checked', on);
+                buttons[i].setAttribute('role', 'radio');
+                Object.assign(buttons[i].style, on
+                    ? { background: '#3ea6ff', color: '#0f0f0f', fontWeight: 'bold', borderColor: '#3ea6ff' }
+                    : { background: '#222', color: '#eee', fontWeight: 'normal', borderColor: '#444' });
+                if (on)
+                    about.textContent = text;
+            });
+            return root;
+        };
 
         const inputs = {
             enabled: check('enabled'),
-            algo: select('algo', [['gpu-next', 'vo=gpu-next (libplacebo)'], ['gpu', 'vo=gpu (legacy)']]),
+            algo: choice('algo', [
+                ['gpu-next', 'gpu-next', 'mpv\'s default: vo=gpu-next debanding (libplacebo).'],
+                ['gpu', 'gpu', 'mpv\'s older vo=gpu debanding shader.'],
+                ['fast', 'Fast', 'For weak GPUs: gpu-next in a single pass, a fraction of the GPU work, nearly the same result.'],
+            ]),
             iterations: number('iterations', 1),
             threshold: number('threshold', 1),
             range: number('range', 1),
@@ -1174,7 +1287,7 @@ void main() {
                 el('strong', { textContent: 'Deband' }),
                 button('×', () => togglePanel(false))),
             row('Enabled', inputs.enabled),
-            row('Algorithm', inputs.algo),
+            el('div', { style: { margin: '10px 0 6px' } }, el('div', { textContent: 'Mode', style: { marginBottom: '4px' } }), inputs.algo),
             row('iterations', inputs.iterations, '--deband-iterations=<0..16> (default 1)'),
             row('threshold', inputs.threshold, '--deband-threshold=<0..4096> (default 48)'),
             row('range', inputs.range, '--deband-range=<1..64> (default 16)'),
@@ -1192,9 +1305,9 @@ void main() {
                     requestRender();
                 })),
             row('Matrix', inputs.matrix, 'YCbCr matrix the browser used to convert the video to RGB'),
-            row('Snap luma', inputs.snap, 'Round recovered luma to the 8-bit code grid, undoing the browser\'s RGB rounding'),
+            row('Snap luma', inputs.snap, 'Round recovered luma to the 8-bit code grid, undoing the browser\'s RGB rounding (not in Fast)'),
             row('Dither', inputs.dither, 'Dither output to 8 bits (mpv dithers by default)'),
-            row('Upload', inputs.precision, 'Format the video frame is uploaded into (WebGL2 only)'),
+            row('Upload', inputs.precision, 'Format the video frame is uploaded into (WebGL2 only; Fast always uses 8-bit)'),
             row('Renderer', inputs.backend, 'Auto uses WebGL2 when available, otherwise WebGL1'),
             row('Split compare', inputs.split, 'Left half original, right half debanded'),
             row('Toggle key', inputs.hotkeyToggle, 'Click, then press the shortcut that turns debanding on and off'),
@@ -1209,7 +1322,9 @@ void main() {
         if (!panel)
             return;
         for (const [key, input] of Object.entries(panel.inputs)) {
-            if (input.type === 'checkbox')
+            if (input.refresh)
+                input.refresh(settings[key]);
+            else if (input.type === 'checkbox')
                 input.checked = !!settings[key];
             else
                 input.value = settings[key];
