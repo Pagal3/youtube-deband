@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         YouTube Deband (mpv / libplacebo)
 // @namespace    youtube-deband
-// @version      1.10.1
-// @description  Debands YouTube video in WebGL2 using a port of mpv's deband shaders (vo=gpu-next / libplacebo and legacy vo=gpu), with mpv's parameters.
+// @version      1.11.0
+// @description  Debands YouTube video in WebGPU or WebGL using a port of mpv's deband shaders (vo=gpu-next / libplacebo and legacy vo=gpu), with mpv's parameters.
 // @match        *://*.youtube.com/*
 // @match        *://www.youtube-nocookie.com/*
 // @exclude      *://music.youtube.com/*
@@ -28,6 +28,10 @@
  * Optionally the browser's chroma upscaling is replaced with Chroma from
  * Luma prediction on the rebuilt planes.
  *
+ * Renders with WebGPU where the browser has it, otherwise WebGL2, otherwise
+ * WebGL1. WebGPU imports the video frame as an external texture instead of
+ * uploading a copy of it.
+ *
  * Shaders:
  *   gpu-next: libplacebo src/shaders/sampling.c pl_shader_deband() with
  *             mpv's option mapping from video/out/vo_gpu_next.c
@@ -48,7 +52,7 @@
     const STORAGE_KEY = 'yt-deband-settings';
     const PRESETS_KEY = 'yt-deband-presets'; // the user's own presets, apart so Reset keeps them
     const PANEL_POS_KEY = 'yt-deband-panel-pos'; // where the panel was dragged to, apart so Reset keeps it
-    const VERSION = '1.10.1'; // keep in sync with @version
+    const VERSION = '1.11.0'; // keep in sync with @version
 
     // Option ranges match mpv's deband_conf (video/out/gpu/video_shaders.c)
     const DEFAULTS = {
@@ -63,8 +67,8 @@
         matrix: '709',      // YCbCr matrix the browser used to make RGB
         snap: true,         // round the recovered luma to the 8-bit code grid
         dither: true,       // dither the output down to 8 bits like mpv does
-        precision: 'half',  // video upload format: 'half' (RGBA16F) | 'byte' (RGBA8), WebGL2 only
-        backend: 'auto',    // 'auto' | 'webgl2' | 'webgl1'
+        precision: 'half',  // video upload format: 'half' (RGBA16F) | 'byte' (RGBA8); WebGL2 and WebGPU copies
+        backend: 'auto',    // 'auto' | 'webgpu' | 'webgl2' | 'webgl1'
         hotkeyToggle: 'Ctrl+Alt+d',
         hotkeyPanel: 'Ctrl+Alt+b',
         split: false,       // left half original, right half debanded
@@ -777,12 +781,446 @@ vec2 upscaleChroma(vec2 p, vec2 uv, float y) { return cfl(p, y); }`;
     };
     // Final pass program suffix per chroma upscaling
     const FINAL_CHROMA = { browser: '', cfl: 'Cfl', 'cfl-lite': 'CflLite' };
+    // Renderer description suffix per chroma upscaling
+    const CHROMA_DESCRIPTION = { browser: '', cfl: ', CfL chroma', 'cfl-lite': ', CfL Lite chroma' };
+
+    // ------------------------------------------------------------------
+    // WGSL shaders (WebGPU)
+    //
+    // Ports of the shaders above. WebGPU always has float render targets and
+    // integers, so there is no PACKED or float PRNG variant, and its
+    // framebuffer origin is top left like the video's, so nothing is flipped.
+    // Passes read the video through srcPixel() and srcLinear(): from an
+    // external texture (the browser's frame, imported without a copy), or
+    // from a copy where the browser can't import video.
+    // ------------------------------------------------------------------
+
+    // The uniforms every pass gets, as [name, components, type], in WGSL
+    // layout order (the vec2s first, so nothing is padded)
+    const WGSL_PARAMS = [
+        ['k', 2], ['srcSize', 2], ['texSize', 2], ['size', 2], ['csize', 2], ['neutral', 2],
+        ['frame', 1], ['iter', 1, 'i32'], ['radius', 1], ['threshold', 1], ['grain', 1],
+        ['random', 1], ['range', 1], ['gain', 1], ['split', 1],
+        ['snap', 1, 'u32'], ['luma', 1, 'u32'], ['dither', 1, 'u32'],
+    ];
+    const PARAMS_SIZE = WGSL_PARAMS.reduce((n, [, c]) => n + 4 * c, 0);
+    const PARAMS_STRIDE = 256; // the largest minUniformBufferOffsetAlignment
+
+    const WGSL_COMMON = `
+struct Params {
+${WGSL_PARAMS.map(([name, c, type]) => `    ${name}: ${c > 1 ? 'vec2f' : type || 'f32'},`).join('\n')}
+}
+@group(0) @binding(0) var<uniform> P: Params;
+@group(0) @binding(1) var s_near: sampler;
+@group(0) @binding(2) var s_lin: sampler;
+
+// One triangle covering the viewport
+@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {
+    return vec4f(vec2f(f32(i & 1u), f32(i >> 1u)) * 4.0 - 1.0, 0.0, 1.0);
+}
+
+// A plane has up to two components (Y, or Cb and Cr)
+fn plane(t: texture_2d<f32>, uv: vec2f) -> vec2f {
+    return textureSampleLevel(t, s_near, uv, 0.0).rg;
+}
+fn planeLinear(t: texture_2d<f32>, uv: vec2f) -> vec2f {
+    return textureSampleLevel(t, s_lin, uv, 0.0).rg;
+}
+
+// As in YCC
+fn rgb2ycc(c: vec3f) -> vec3f {
+    let kr = P.k.x;
+    let kb = P.k.y;
+    let kg = 1.0 - kr - kb;
+    let y = kr * c.r + kg * c.g + kb * c.b;
+    return vec3f(16.0  + 219.0 * y,
+                 128.0 + 224.0 * (c.b - y) / (2.0 - 2.0 * kb),
+                 128.0 + 224.0 * (c.r - y) / (2.0 - 2.0 * kr)) / 255.0;
+}
+fn dycc2rgb(d: vec3f) -> vec3f {
+    let kr = P.k.x;
+    let kb = P.k.y;
+    let kg = 1.0 - kr - kb;
+    let y  = d.x * 255.0 / 219.0;
+    let cb = d.y * 255.0 / 224.0;
+    let cr = d.z * 255.0 / 224.0;
+    let r = y + (2.0 - 2.0 * kr) * cr;
+    let b = y + (2.0 - 2.0 * kb) * cb;
+    return vec3f(r, (y - kr * r - kb * b) / kg, b);
+}
+
+// The canvas pixel at fc: dithered to 8 bits if asked, clamped, opaque
+fn finish(fc: vec2f, rgb: vec3f) -> vec4f {
+    var c = rgb;
+    if (P.dither != 0u) {
+        let n = fract(52.9829189 * fract(dot(fc, vec2f(0.06711056, 0.00583715))));
+        c = floor(c * 255.0 + n) / 255.0;
+    }
+    return vec4f(clamp(c, vec3f(0.0), vec3f(1.0)), 1.0);
+}
+`;
+
+    // The video as an external texture. The browser may hand it over as the
+    // decoder's YCbCr planes, which are converted per sample, so a pixel is
+    // read bilinearly at its center: that is exact for luma (and for RGB)
+    // and upscales chroma the way the browser does for display. Nearest
+    // sampling would upscale chroma blockily.
+    const WGSL_SRC_EXTERNAL = `
+@group(0) @binding(3) var u_src: texture_external;
+fn srcPixel(uv: vec2f) -> vec3f {
+    let size = vec2f(textureDimensions(u_src));
+    return textureSampleBaseClampToEdge(u_src, s_lin, (floor(uv * size) + 0.5) / size).rgb;
+}
+fn srcLinear(uv: vec2f) -> vec3f {
+    return textureSampleBaseClampToEdge(u_src, s_lin, uv).rgb;
+}`;
+    // The video copied into an RGBA texture
+    const WGSL_SRC_COPY = `
+@group(0) @binding(3) var u_src: texture_2d<f32>;
+fn srcPixel(uv: vec2f) -> vec3f {
+    return textureSampleLevel(u_src, s_near, uv, 0.0).rgb;
+}
+fn srcLinear(uv: vec2f) -> vec3f {
+    return textureSampleLevel(u_src, s_lin, uv, 0.0).rgb;
+}`;
+
+    // As FS_PREP_Y, FS_PREP_C and FS_PREP_YL
+    const WGSL_PREP_Y = `
+@fragment fn fs(@builtin(position) fc: vec4f) -> @location(0) vec4f {
+    var y = rgb2ycc(srcPixel(fc.xy / P.srcSize)).x;
+    if (P.snap != 0u) {
+        y = floor(y * 255.0 + 0.5) / 255.0;
+    }
+    return vec4f(y, 0.0, 0.0, 1.0);
+}`;
+    const WGSL_PREP_C = `
+@fragment fn fs(@builtin(position) fc: vec4f) -> @location(0) vec4f {
+    let mid = floor(fc.xy) * 2.0 + 1.0;
+    let c = rgb2ycc(srcLinear(mid / P.srcSize));
+    if (P.luma != 0u) {
+        return vec4f(c.x, 0.0, 0.0, 1.0);
+    }
+    return vec4f(c.yz, 0.0, 1.0);
+}`;
+    const WGSL_PREP_YL = `
+@fragment fn fs(@builtin(position) fc: vec4f) -> @location(0) vec4f {
+    let mid = floor(fc.xy) * 2.0 + 1.0;
+    let rgb = srcLinear((mid + vec2f(-0.65625, -0.65625)) / P.srcSize)
+            + srcLinear((mid + vec2f( 0.65625, -0.65625)) / P.srcSize)
+            + srcLinear((mid + vec2f(-0.65625,  0.65625)) / P.srcSize)
+            + srcLinear((mid + vec2f( 0.65625,  0.65625)) / P.srcSize);
+    return vec4f(rgb2ycc(0.25 * rgb).x, 0.0, 0.0, 1.0);
+}`;
+
+    // pcg3d as in PRNG
+    const WGSL_PRNG = `
+var<private> state: vec3u;
+fn prng() -> vec3f {
+    var s = 1664525u * state + vec3u(1013904223u);
+    s.x += s.y * s.z;
+    s.y += s.z * s.x;
+    s.z += s.x * s.y;
+    s ^= s >> vec3u(16u);
+    s.x += s.y * s.z;
+    s.y += s.z * s.x;
+    s.z += s.x * s.y;
+    state = s;
+    return vec3f(s >> vec3u(8u)) * (1.0 / 16777216.0);
+}`;
+
+    // pl_shader_deband() as in debandNext, always on two components: luma
+    // only uses the first, which comes out the same
+    const WGSL_DEBAND_NEXT = WGSL_PRNG + `
+@group(0) @binding(4) var u_tex: texture_2d<f32>;
+fn deband(px: vec2f) -> vec2f {
+    let pt = 1.0 / P.texSize;
+    let pos = (px + 0.5) * pt;
+    state = vec3u(vec2u(px), u32(P.frame));
+    let orig = plane(u_tex, pos);
+    var res = orig;
+
+    // For each iteration, compute the average at a given distance and
+    // pick it instead of the color if the difference is below the threshold.
+    for (var i = 1; i <= P.iter; i++) {
+        var d = prng().xy * vec2f(f32(i) * P.radius, 6.283185);
+        d = d.x * vec2f(cos(d.y), sin(d.y));
+        let avg = 0.25 * (plane(u_tex, pos + pt * vec2f( d.x,  d.y)) +
+                          plane(u_tex, pos + pt * vec2f(-d.x,  d.y)) +
+                          plane(u_tex, pos + pt * vec2f(-d.x, -d.y)) +
+                          plane(u_tex, pos + pt * vec2f( d.x, -d.y)));
+        res = select(avg, res, abs(res - avg) > vec2f(P.threshold / f32(i)));
+    }
+
+    // Add some random noise to smooth out residual differences, avoiding
+    // grain near true black
+    if (P.grain > 0.0) {
+        let strength = min(abs(res - P.neutral), vec2f(P.grain));
+        res += strength * (prng().xy - 0.5);
+    }
+    return res - orig;
+}`;
+
+    // pass_sample_deband() as in DEBAND_LEGACY
+    const WGSL_DEBAND_LEGACY = `
+@group(0) @binding(4) var u_tex: texture_2d<f32>;
+fn mod289(x: f32) -> f32 { return x - floor(x * (1.0 / 289.0)) * 289.0; }
+fn permute(x: f32) -> f32 { return mod289(mod289(34.0 * x + 1.0) * (fract(x) + 1.0)); }
+fn rand(x: f32) -> f32 { return fract(x * (1.0 / 41.0)); }
+
+// Stochastic approximation of the avg color around a pixel
+fn average(pos: vec2f, pt: vec2f, range: f32, h: ptr<function, f32>) -> vec2f {
+    let dist = rand(*h) * range;     *h = permute(*h);
+    let dir  = rand(*h) * 6.2831853; *h = permute(*h);
+    let off = dist * vec2f(cos(dir), sin(dir));
+    let ref0 = planeLinear(u_tex, pos + pt * vec2f( off.x,  off.y));
+    let ref1 = planeLinear(u_tex, pos + pt * vec2f(-off.y,  off.x));
+    let ref2 = planeLinear(u_tex, pos + pt * vec2f(-off.x, -off.y));
+    let ref3 = planeLinear(u_tex, pos + pt * vec2f( off.y, -off.x));
+    return (ref0 + ref1 + ref2 + ref3) * 0.25;
+}
+
+fn deband(px: vec2f) -> vec2f {
+    let pt = 1.0 / P.texSize;
+    let pos = (px + 0.5) * pt;
+    let m = vec3f(pos, P.random) + vec3f(1.0);
+    var h = permute(permute(permute(m.x) + m.y) + m.z);
+
+    let orig = planeLinear(u_tex, pos);
+    var color = orig;
+    for (var i = 1; i <= P.iter; i++) {
+        let avg = average(pos, pt, f32(i) * P.range, &h);
+        let diff = abs(color - avg);
+        color = select(avg, color, diff > vec2f(P.threshold / (f32(i) * 16384.0)));
+    }
+
+    let noise = vec2f(rand(h), rand(permute(h)));
+    color += P.gain * (noise - vec2f(0.5));
+    return color - orig;
+}`;
+
+    // As fsChroma
+    const wgslChroma = (deband) => deband + `
+@fragment fn fs(@builtin(position) fc: vec4f) -> @location(0) vec4f {
+    return vec4f(deband(floor(fc.xy)), 0.0, 1.0);
+}`;
+
+    // As fsFinal; upscale defines UPSCALE_CHROMA and upscaleChroma()
+    const wgslFinal = (deband, upscale) => deband + upscale + `
+@group(0) @binding(5) var u_c: texture_2d<f32>;
+@fragment fn fs(@builtin(position) fc: vec4f) -> @location(0) vec4f {
+    let p = floor(fc.xy);
+    let uv = (p + 0.5) / P.size;
+    var rgb = srcPixel(uv);
+    if (p.x >= P.split * P.size.x) {
+        var dc = planeLinear(u_c, (p + 0.5) / (2.0 * P.csize));
+        if (UPSCALE_CHROMA) {
+            // The change from the browser's upscaled chroma is a chroma change too
+            let ycc = rgb2ycc(rgb);
+            dc += upscaleChroma(p, uv, ycc.x) - ycc.yz;
+        }
+        rgb += dycc2rgb(vec3f(deband(p).x, dc));
+    }
+    return finish(fc.xy, rgb);
+}`;
+
+    // As FS_FAST
+    const WGSL_FAST = `
+fn rand3(q: vec3f) -> vec3f {
+    var p = fract(q * vec3f(0.1347, 0.1593, 0.1771) + q.yzx * vec3f(0.0719, 0.0547, 0.0613));
+    p += dot(p, p.zxy + 19.19);
+    return fract((p + p.yzx) * p.zxy * 3.71);
+}
+
+@fragment fn fs(@builtin(position) fc: vec4f) -> @location(0) vec4f {
+    let p = floor(fc.xy);
+    let pt = 1.0 / P.texSize;
+    let pos = (p + 0.5) * pt;
+    var rgb = srcPixel(pos);
+    if (p.x >= P.split * P.texSize.x) {
+        let seed = (P.frame % 256.0) * 17.0;
+        let orig = rgb2ycc(rgb);
+        var res = orig;
+        for (var i = 1; i <= P.iter; i++) {
+            var d = rand3(vec3f(p, seed + f32(i))).xy * vec2f(f32(i) * P.radius, 6.283185);
+            d = d.x * vec2f(cos(d.y), sin(d.y)) * pt;
+            let avg = rgb2ycc(0.25 * (srcPixel(pos + d) +
+                                      srcPixel(pos + vec2f(-d.x, d.y)) +
+                                      srcPixel(pos - d) +
+                                      srcPixel(pos + vec2f(d.x, -d.y))));
+            res = select(avg, res, abs(res - avg) > vec3f(P.threshold / f32(i)));
+        }
+        if (P.grain > 0.0) {
+            let strength = min(abs(res - vec3f(16.0, 128.0, 128.0) / 255.0), vec3f(P.grain));
+            res += strength * (rand3(vec3f(p, seed)) - 0.5);
+        }
+        rgb += dycc2rgb(res - orig);
+    }
+    return finish(fc.xy, rgb);
+}`;
+
+    // CFL ported to WGSL (same notice), the lite variant if lite
+    const wgslCfl = (lite) => `
+const CFL_LITE = ${lite};
+@group(0) @binding(6) var u_yl: texture_2d<f32>;
+@group(0) @binding(7) var u_cl: texture_2d<f32>;
+
+fn lowUv(t: vec2f) -> vec2f {
+    return (clamp(t, vec2f(0.0), P.csize - 1.0) + 0.5) / P.csize;
+}
+
+struct Fit { n: f32, y: f32, yy: f32, c: vec2f, cc: vec2f, yc: vec2f }
+
+fn fitAdd(a: Fit, b: Fit) -> Fit {
+    return Fit(a.n + b.n, a.y + b.y, a.yy + b.yy, a.c + b.c, a.cc + b.cc, a.yc + b.yc);
+}
+
+fn fitPredict(f: Fit, y: f32, y0: f32, c0: vec2f) -> vec2f {
+    let yvar = max(f.yy - f.y * f.y / f.n, 0.0);
+    let alpha = (f.yc - f.y * f.c / f.n) / max(yvar, 1e-6);
+    return clamp(c0 + f.c / f.n + alpha * (y - y0 - f.y / f.n), vec2f(0.0), vec2f(1.0));
+}
+
+fn fitCorr(f: Fit) -> vec2f {
+    let yvar = max(f.yy - f.y * f.y / f.n, 0.0);
+    let cvar = max(f.cc - f.c * f.c / f.n, vec2f(0.0));
+    return clamp(abs(f.yc - f.y * f.c / f.n) / max(sqrt(yvar * cvar), vec2f(1e-6)), vec2f(0.0), vec2f(1.0));
+}
+
+fn cflWeight(v: vec2f) -> f32 {
+    if (CFL_LITE) {
+        let d2 = min(dot(v, v), 4.0);
+        let d4 = d2 * d2;
+        return (d4 - 8.0 * d2 + 16.0) * (d4 - 5.0 * d2 + 4.0);
+    }
+    let d = min(length(v), 2.0);
+    let d2 = d * d;
+    let d3 = d2 * d;
+    return select(-0.75 * d3 + 3.75 * d2 - 6.0 * d + 3.0, 1.25 * d3 - 2.25 * d2 + 1.0, d < 1.0);
+}
+
+fn cfl(p: vec2f, y: f32) -> vec2f {
+    var pp = (p + 0.5) * 0.5 - 0.5;
+    let fp = floor(pp);
+    pp -= fp;
+
+    let y0 = plane(u_yl, lowUv(fp)).x;
+    let c0 = plane(u_cl, lowUv(fp));
+    var ymin = y0;
+    var ymax = y0;
+    var wt = 0.0;
+    var cmin = c0;
+    var cmax = c0;
+    var ct = vec2f(0.0);
+    var fi = Fit();
+    var fv = Fit();
+    var fh = Fit();
+    for (var j = -1; j <= 2; j++) {
+        for (var i = -1; i <= 2; i++) {
+            let inx = i == 0 || i == 1;
+            let iny = j == 0 || j == 1;
+            let corner = !inx && !iny;
+            if (CFL_LITE && corner) {
+                continue;
+            }
+            let o = vec2f(f32(i), f32(j));
+            let uv = lowUv(fp + o);
+            let c = plane(u_cl, uv);
+            let w = cflWeight(o - pp);
+            wt += w;
+            ct += w * c;
+            if (corner) {
+                continue;
+            }
+            let yl = plane(u_yl, uv).x;
+            ymin = min(ymin, yl);
+            ymax = max(ymax, yl);
+            let dy = yl - y0;
+            let dc = c - c0;
+            let s = Fit(1.0, dy, dy * dy, dc, dc * dc, dy * dc);
+            if (inx && iny) {
+                cmin = min(cmin, c);
+                cmax = max(cmax, c);
+                fi = fitAdd(fi, s);
+            } else if (inx) {
+                fv = fitAdd(fv, s);
+            } else {
+                fh = fitAdd(fh, s);
+            }
+        }
+    }
+    var spatial = ct / wt;
+    spatial = clamp(mix(spatial, clamp(spatial, cmin, cmax), vec2f(0.8)), vec2f(0.0), vec2f(1.0));
+
+    let f12 = fitAdd(fitAdd(fi, fv), fh);
+    var corr = fitCorr(f12);
+    corr *= corr;
+    let extrapolation = max(max(y - ymax, ymin - y), 0.0) / max(ymax - ymin, 1e-6);
+    let mixCoeff = 0.8 * corr * corr * clamp((8.0 - extrapolation) / 4.0, 0.0, 1.0);
+    var pred = fitPredict(f12, y, y0, c0);
+    if (!CFL_LITE) {
+        let pred8 = mix(fitPredict(fitAdd(fi, fv), y, y0, c0), fitPredict(fitAdd(fi, fh), y, y0, c0), vec2f(0.5));
+        pred = mix(pred, pred8, vec2f(0.5));
+    }
+    return clamp(mix(spatial, pred, mixCoeff), vec2f(0.0), vec2f(1.0));
+}
+`;
+
+    // As FS_CFL
+    const WGSL_CFL_PASS = `
+@fragment fn fs(@builtin(position) fc: vec4f) -> @location(0) vec4f {
+    let p = floor(fc.xy);
+    return vec4f(cfl(p, rgb2ycc(srcPixel((p + 0.5) / P.size)).x), 0.0, 1.0);
+}`;
+
+    // As UPSCALE_CFL and UPSCALE_CFL_LITE, and the browser's upscaling
+    const WGSL_UPSCALE_NONE = `
+const UPSCALE_CHROMA = false;
+fn upscaleChroma(p: vec2f, uv: vec2f, y: f32) -> vec2f { return vec2f(0.0); }`;
+    const WGSL_UPSCALE_CFL = `
+@group(0) @binding(8) var u_pred: texture_2d<f32>;
+const UPSCALE_CHROMA = true;
+fn upscaleChroma(p: vec2f, uv: vec2f, y: f32) -> vec2f {
+    let d = 1.0 / P.size;
+    let y0 = plane(u_tex, uv).x;
+    var wt = 0.0;
+    var ct = vec2f(0.0);
+    for (var j = -1; j <= 1; j++) {
+        for (var i = -1; i <= 1; i++) {
+            let o = vec2f(f32(i), f32(j));
+            let dy = y0 - plane(u_tex, uv + o * d).x;
+            let w = max(100.0 * exp(-2.0 * dot(o, o) - 128.0 * dy * dy), 1e-32);
+            wt += w;
+            ct += w * plane(u_pred, uv + o * d);
+        }
+    }
+    return clamp(ct / wt, vec2f(0.0), vec2f(1.0));
+}`;
+    const WGSL_UPSCALE_CFL_LITE = wgslCfl(true) + `
+const UPSCALE_CHROMA = true;
+fn upscaleChroma(p: vec2f, uv: vec2f, y: f32) -> vec2f { return cfl(p, y); }`;
+
+    // The fragment shader of each program, by the names of PROGRAMS
+    const WGSL_PROGRAMS = {
+        prepY: WGSL_PREP_Y,
+        prepC: WGSL_PREP_C,
+        prepYL: WGSL_PREP_YL,
+        cfl: wgslCfl(false) + WGSL_CFL_PASS,
+        nextC: wgslChroma(WGSL_DEBAND_NEXT),
+        nextFinal: wgslFinal(WGSL_DEBAND_NEXT, WGSL_UPSCALE_NONE),
+        nextFinalCfl: wgslFinal(WGSL_DEBAND_NEXT, WGSL_UPSCALE_CFL),
+        nextFinalCflLite: wgslFinal(WGSL_DEBAND_NEXT, WGSL_UPSCALE_CFL_LITE),
+        legacyC: wgslChroma(WGSL_DEBAND_LEGACY),
+        legacyFinal: wgslFinal(WGSL_DEBAND_LEGACY, WGSL_UPSCALE_NONE),
+        legacyFinalCfl: wgslFinal(WGSL_DEBAND_LEGACY, WGSL_UPSCALE_CFL),
+        legacyFinalCflLite: wgslFinal(WGSL_DEBAND_LEGACY, WGSL_UPSCALE_CFL_LITE),
+        fast: WGSL_FAST,
+    };
 
     // ------------------------------------------------------------------
     // WebGL renderer
     // ------------------------------------------------------------------
 
-    class Debander {
+    class WebGLDebander {
         // backend: 'auto' | 'webgl2' | 'webgl1'
         constructor(canvas, backend) {
             this.canvas = canvas;
@@ -858,8 +1296,7 @@ vec2 upscaleChroma(vec2 p, vec2 uv, float y) { return cfl(p, y); }`;
         get description() {
             return `${this.webgl2 ? 'WebGL2' : 'WebGL1'}, ` +
                    `${this.fast ? 'single pass' : (this.packed ? 'packed 16-bit' : 'float') + ' planes'}, ` +
-                   `${this.uploadFormat === 'half' ? 'RGBA16F' : 'RGBA8'} upload` +
-                   (this.chroma === 'cfl' ? ', CfL chroma' : this.chroma === 'cfl-lite' ? ', CfL Lite chroma' : '');
+                   `${this.uploadFormat === 'half' ? 'RGBA16F' : 'RGBA8'} upload` + CHROMA_DESCRIPTION[this.chroma];
         }
 
         prog(name) {
@@ -1141,6 +1578,246 @@ vec2 upscaleChroma(vec2 p, vec2 uv, float y) { return cfl(p, y); }`;
     }
 
     // ------------------------------------------------------------------
+    // WebGPU renderer: the WebGL renderer's passes in WGSL, recorded into one
+    // command buffer per frame
+    // ------------------------------------------------------------------
+
+    class WebGPUDebander {
+        static async create(canvas) {
+            if (!navigator.gpu)
+                throw new Error('WebGPU is not available');
+            // The default adapter: on laptops with two GPUs, usually the one
+            // decoding the video
+            const adapter = await navigator.gpu.requestAdapter();
+            if (!adapter)
+                throw new Error('WebGPU has no adapter (GPU blocklisted or disabled?)');
+            return new WebGPUDebander(canvas, await adapter.requestDevice());
+        }
+
+        constructor(canvas, device) {
+            this.canvas = canvas;
+            this.device = device;
+            this.frame = 0;
+            this.w = 0;
+            this.h = 0;
+            this.copyFormat = null;
+            this.fast = false;
+            this.chroma = 'browser';
+            this.textures = [];
+            this.pipelines = {};
+            this.maxSize = device.limits.maxTextureDimension2D;
+            // Video is imported as an external texture until the browser
+            // turns that down
+            this.external = typeof device.importExternalTexture === 'function';
+            this.near = device.createSampler({ magFilter: 'nearest', minFilter: 'nearest' });
+            this.lin = device.createSampler({ magFilter: 'linear', minFilter: 'linear' });
+            // A slot of uniforms per pass, written in one go each frame
+            const maxPasses = 6;
+            this.params = device.createBuffer({
+                size: PARAMS_STRIDE * maxPasses, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+            });
+            this.paramData = new DataView(new ArrayBuffer(PARAMS_STRIDE * maxPasses));
+            this.format = navigator.gpu.getPreferredCanvasFormat();
+            this.context = canvas.getContext('webgpu');
+            if (!this.context) {
+                device.destroy();
+                throw new Error('The canvas has no WebGPU context');
+            }
+            this.context.configure({ device, format: this.format, alphaMode: 'opaque' });
+        }
+
+        get description() {
+            return `WebGPU, ${this.fast ? 'single pass' : 'float planes'}, ` +
+                   (this.external ? 'imported video' : `${this.copyFormat === 'rgba16float' ? 'RGBA16F' : 'RGBA8'} copy`) +
+                   CHROMA_DESCRIPTION[this.chroma];
+        }
+
+        destroy() {
+            this.device.destroy();
+        }
+
+        // The program name rendering to format. Its bind group layout comes
+        // from the bindings the code declares, used or not.
+        pipeline(name, format) {
+            const key = name + ' ' + format;
+            if (this.pipelines[key])
+                return this.pipelines[key];
+            const device = this.device;
+            const code = WGSL_COMMON + (this.external ? WGSL_SRC_EXTERNAL : WGSL_SRC_COPY) + WGSL_PROGRAMS[name];
+            const module = device.createShaderModule({ code });
+            module.getCompilationInfo().then((info) => {
+                for (const m of info.messages) {
+                    if (m.type === 'error')
+                        console.error(`[yt-deband] WGSL ${name} ${m.lineNum}:${m.linePos}: ${m.message}`);
+                }
+            });
+            const bindings = [...code.matchAll(/@binding\((\d+)\) var(<uniform>)? (\w+): (\w+)/g)]
+                .map(([, binding, uniform, name, type]) => ({ binding: +binding, name, type: uniform ? 'uniform' : type }));
+            const layout = device.createBindGroupLayout({
+                entries: bindings.map(({ binding, type }) => Object.assign({ binding, visibility: GPUShaderStage.FRAGMENT },
+                    type === 'uniform' ? { buffer: {} }
+                        : type === 'sampler' ? { sampler: {} }
+                            : type === 'texture_external' ? { externalTexture: {} } : { texture: {} })),
+            });
+            const pipeline = device.createRenderPipeline({
+                layout: device.createPipelineLayout({ bindGroupLayouts: [layout] }),
+                vertex: { module, entryPoint: 'vs' },
+                fragment: { module, entryPoint: 'fs', targets: [{ format }] },
+            });
+            return (this.pipelines[key] = { pipeline, layout, bindings });
+        }
+
+        texture(w, h, format, copyDst) {
+            const tex = this.device.createTexture({
+                size: [w, h], format,
+                usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.RENDER_ATTACHMENT |
+                       (copyDst ? GPUTextureUsage.COPY_DST : 0),
+            });
+            this.textures.push(tex);
+            return { tex, view: tex.createView(), format, w, h };
+        }
+
+        // Formats as in WebGLDebander.resize()
+        resize(w, h, s) {
+            const fast = s.algo === 'fast';
+            // A copied frame is uploaded as in WebGL2
+            const copyFormat = this.external ? null : s.precision === 'half' && !fast ? 'rgba16float' : 'rgba8unorm';
+            const yFormat = fast ? null : s.snap && s.algo !== 'gpu' ? 'r8unorm' : 'r16float';
+            const chroma = !fast && (s.chroma === 'cfl' || s.chroma === 'cfl-lite') ? s.chroma : 'browser';
+            if (w === this.w && h === this.h && copyFormat === this.copyFormat && yFormat === this.yFormat &&
+                chroma === this.chroma)
+                return;
+            for (const t of this.textures)
+                t.destroy();
+            this.textures = [];
+
+            const cw = Math.ceil(w / 2), ch = Math.ceil(h / 2);
+            this.src = copyFormat && this.texture(w, h, copyFormat, true);
+            if (!fast) {
+                this.yPrep = this.texture(w, h, yFormat);
+                this.cPrep = this.texture(cw, ch, 'rg16float');
+                this.cDelta = this.texture(cw, ch, 'rg16float');
+            }
+            if (chroma !== 'browser')
+                this.yLow = this.texture(cw, ch, 'r16float');
+            if (chroma === 'cfl')
+                this.cPred = this.texture(w, h, 'rg16float');
+
+            this.canvas.width = w;
+            this.canvas.height = h;
+            this.w = w;
+            this.h = h;
+            this.copyFormat = copyFormat;
+            this.yFormat = yFormat;
+            this.fast = fast;
+            this.chroma = chroma;
+        }
+
+        // Params into the uniform slot at offset, in WGSL_PARAMS layout;
+        // missing ones are 0
+        writeParams(offset, params) {
+            const view = this.paramData;
+            for (const [name, n, type] of WGSL_PARAMS) {
+                const v = params[name];
+                for (let i = 0; i < n; i++, offset += 4) {
+                    const x = v === undefined ? 0 : n > 1 ? v[i] : v;
+                    if (type === 'i32')
+                        view.setInt32(offset, x, true);
+                    else if (type === 'u32')
+                        view.setUint32(offset, x, true);
+                    else
+                        view.setFloat32(offset, x, true);
+                }
+            }
+        }
+
+        render(video, s) {
+            const device = this.device;
+            this.resize(video.videoWidth, video.videoHeight, s);
+            let src;
+            if (this.external) {
+                try {
+                    src = device.importExternalTexture({ source: video });
+                } catch (e) {
+                    console.info('[yt-deband] WebGPU can\'t import the video, copying it instead:', e.message);
+                    this.external = false;
+                    this.pipelines = {};
+                    return this.render(video, s);
+                }
+            } else {
+                device.queue.copyExternalImageToTexture({ source: video }, { texture: this.src.tex }, [this.w, this.h]);
+                src = this.src.view;
+            }
+
+            const k = MATRICES[s.matrix] || MATRICES['709'];
+            this.frame = (this.frame + 1) % 16777216;
+            const legacy = s.algo === 'gpu';
+            const random = Math.random();
+            const encoder = device.createCommandEncoder();
+            let slots = 0;
+            // Draws program name into target (null for the canvas) with
+            // params and the textures in inputs, by binding name
+            const pass = (name, target, inputs, params) => {
+                const p = this.pipeline(name, target ? target.format : this.format);
+                const offset = PARAMS_STRIDE * slots++;
+                this.writeParams(offset, params);
+                const resources = Object.assign({
+                    P: { buffer: this.params, offset, size: PARAMS_SIZE },
+                    s_near: this.near, s_lin: this.lin, u_src: src,
+                }, inputs);
+                const group = device.createBindGroup({
+                    layout: p.layout,
+                    entries: p.bindings.map(({ binding, name }) => ({ binding, resource: resources[name] })),
+                });
+                const rp = encoder.beginRenderPass({
+                    colorAttachments: [{
+                        view: target ? target.view : this.context.getCurrentTexture().createView(),
+                        loadOp: 'clear', storeOp: 'store',
+                    }],
+                });
+                rp.setPipeline(p.pipeline);
+                rp.setBindGroup(0, group);
+                rp.draw(3);
+                rp.end();
+            };
+            // Deband params for a plane, mapped as in WebGLDebander.render()
+            const deband = (plane, neutral) => Object.assign({ texSize: [plane.w, plane.h], iter: s.iterations }, legacy
+                ? { random, range: s.range, threshold: s.threshold, gain: s.grain / 8192.0 }
+                : { frame: this.frame, radius: s.range, threshold: s.threshold / 16.384 / 1000,
+                    grain: s.grain / 8.192 / 1000, neutral: [neutral, neutral] });
+            const output = { k, dither: s.dither ? 1 : 0, split: s.split ? 0.5 : -1.0 };
+
+            if (this.fast) {
+                pass('fast', null, {}, Object.assign(deband(this, 0), output));
+            } else {
+                const srcParams = { k, srcSize: [this.w, this.h] };
+                pass('prepY', this.yPrep, {}, Object.assign({ snap: s.snap ? 1 : 0 }, srcParams));
+                pass('prepC', this.cPrep, {}, srcParams);
+
+                let upscaleInputs = {};
+                if (this.chroma === 'cfl-lite') {
+                    pass('prepC', this.yLow, {}, Object.assign({ luma: 1 }, srcParams));
+                    upscaleInputs = { u_yl: this.yLow.view, u_cl: this.cPrep.view };
+                } else if (this.chroma === 'cfl') {
+                    pass('prepYL', this.yLow, {}, srcParams);
+                    pass('cfl', this.cPred, { u_yl: this.yLow.view, u_cl: this.cPrep.view },
+                         { k, size: [this.w, this.h], csize: [this.cPrep.w, this.cPrep.h] });
+                    upscaleInputs = { u_pred: this.cPred.view };
+                }
+
+                pass(legacy ? 'legacyC' : 'nextC', this.cDelta, { u_tex: this.cPrep.view },
+                     deband(this.cPrep, 128 / 255));
+                pass((legacy ? 'legacyFinal' : 'nextFinal') + FINAL_CHROMA[this.chroma], null,
+                     Object.assign({ u_tex: this.yPrep.view, u_c: this.cDelta.view }, upscaleInputs),
+                     Object.assign(deband(this.yPrep, 16 / 255), output,
+                                   { size: [this.w, this.h], csize: [this.cDelta.w, this.cDelta.h] }));
+            }
+            device.queue.writeBuffer(this.params, 0, this.paramData.buffer, 0, PARAMS_STRIDE * slots);
+            device.queue.submit([encoder.finish()]);
+        }
+    }
+
+    // ------------------------------------------------------------------
     // Attaching to the YouTube player
     // ------------------------------------------------------------------
 
@@ -1253,18 +1930,85 @@ vec2 upscaleChroma(vec2 p, vec2 uv, float y) { return cfl(p, y); }`;
             o.disconnect();
         boxObservers = [];
         canvas.remove();
-        video = canvas = debander = null;
+        if (debander && debander.destroy)
+            debander.destroy();
+        video = canvas = debander = creating = null;
+    }
+
+    // WebGPU failed on this page, so Auto uses WebGL until it reloads
+    let webgpuBroken = false;
+    // Token of the renderer being set up, while it is (WebGPU sets up
+    // asynchronously)
+    let creating = null;
+
+    // Auto tries WebGPU first, then WebGL2, then WebGL1
+    async function makeDebander(c, backend) {
+        if (backend === 'webgpu' || (backend === 'auto' && !webgpuBroken)) {
+            try {
+                return await WebGPUDebander.create(c);
+            } catch (e) {
+                if (backend === 'webgpu')
+                    throw e;
+                console.info('[yt-deband] WebGPU unavailable, using WebGL:', e.message);
+            }
+        }
+        return new WebGLDebander(c, backend);
     }
 
     function createDebander() {
-        try {
-            debander = new Debander(canvas, settings.backend);
-            setStatus('Ready: ' + debander.description);
-        } catch (e) {
+        const token = creating = {};
+        makeDebander(canvas, settings.backend).then((d) => {
+            if (creating !== token) {
+                // Detached or replaced meanwhile
+                if (d.destroy)
+                    d.destroy();
+                return;
+            }
+            creating = null;
+            debander = d;
+            if (d.device)
+                watchDevice(d);
+            setStatus('Ready: ' + d.description);
+            requestRender();
+        }, (e) => {
+            if (creating !== token)
+                return;
+            creating = null;
             debander = null;
             setStatus('Error: ' + e.message);
             console.error('[yt-deband]', e);
+        });
+    }
+
+    // A lost device (driver reset, GPU process crash) is set up again on a new
+    // canvas, so WebGL can take over if WebGPU doesn't come back; an error
+    // fails over
+    function watchDevice(d) {
+        d.device.lost.then((info) => {
+            if (debander !== d || info.reason === 'destroyed')
+                return;
+            console.warn('[yt-deband] WebGPU device lost:', info.message);
+            attach(video);
+        });
+        d.device.addEventListener('uncapturederror', (e) => {
+            if (debander === d)
+                webgpuFailed(e.error.message);
+        });
+    }
+
+    // WebGPU broke while rendering. Auto carries on with WebGL, on a new
+    // canvas since a canvas keeps its first context type.
+    function webgpuFailed(message) {
+        console.error('[yt-deband] WebGPU:', message);
+        if (settings.backend === 'auto') {
+            webgpuBroken = true;
+            attach(video);
+            return;
         }
+        canvas.style.display = 'none';
+        setStatus('Error: WebGPU: ' + message);
+        debander.destroy();
+        debander = null;
     }
 
     // Render on every new video frame with requestVideoFrameCallback.
@@ -1364,10 +2108,10 @@ vec2 upscaleChroma(vec2 p, vec2 uv, float y) { return cfl(p, y); }`;
     function skipReason() {
         // EME protected video uploads as black (or not at all)
         if (video.mediaKeys)
-            return 'protected (DRM) video, which browsers do not let WebGL read.';
+            return 'protected (DRM) video, which browsers do not let WebGL or WebGPU read.';
         if (video.videoWidth > debander.maxSize || video.videoHeight > debander.maxSize)
             return `${video.videoWidth}x${video.videoHeight} video exceeds this browser's ` +
-                   `${debander.maxSize}px WebGL texture limit (fingerprinting protection). Use 1080p or lower.`;
+                   `${debander.maxSize}px texture limit (fingerprinting protection). Use 1080p or lower.`;
         if (hdrStream())
             return 'HDR video (PQ/HLG or BT.2020); only SDR BT.709/BT.601 is supported.';
         return null;
@@ -1437,6 +2181,8 @@ vec2 upscaleChroma(vec2 p, vec2 uv, float y) { return cfl(p, y); }`;
                 stats.since = t1;
             }
         } catch (e) {
+            if (debander.device)
+                return webgpuFailed(e.message);
             canvas.style.display = 'none';
             setStatus('Error: ' + e.message);
             console.error('[yt-deband]', e);
@@ -1472,7 +2218,7 @@ vec2 upscaleChroma(vec2 p, vec2 uv, float y) { return cfl(p, y); }`;
                 attach(v);
             else
                 detach();
-        } else if (video && !debander && settings.enabled && !status.startsWith('Error')) {
+        } else if (video && !debander && !creating && settings.enabled && !status.startsWith('Error')) {
             createDebander();
         }
     }, 1000);
@@ -1509,9 +2255,13 @@ vec2 upscaleChroma(vec2 p, vec2 uv, float y) { return cfl(p, y); }`;
         Object.assign(settings, values);
         saveSettings();
         refreshPanel();
-        // A canvas keeps its first context type, so a backend switch needs a new one
-        if ('backend' in values && video)
-            attach(video);
+        // A canvas keeps its first context type, so a backend switch needs a
+        // new one. Picking a renderer also gives WebGPU another chance.
+        if ('backend' in values) {
+            webgpuBroken = false;
+            if (video)
+                attach(video);
+        }
         requestRender();
     }
 
@@ -1712,7 +2462,7 @@ vec2 upscaleChroma(vec2 p, vec2 uv, float y) { return cfl(p, y); }`;
             snap: check('snap'),
             dither: check('dither'),
             precision: select('precision', [['half', 'Half float (RGBA16F)'], ['byte', '8-bit (RGBA8)']]),
-            backend: select('backend', [['auto', 'Auto'], ['webgl2', 'WebGL2'], ['webgl1', 'WebGL1']]),
+            backend: select('backend', [['auto', 'Auto'], ['webgpu', 'WebGPU'], ['webgl2', 'WebGL2'], ['webgl1', 'WebGL1']]),
             split: check('split'),
             hotkeyToggle: hotkey('hotkeyToggle'),
             hotkeyPanel: hotkey('hotkeyPanel'),
@@ -1794,8 +2544,8 @@ vec2 upscaleChroma(vec2 p, vec2 uv, float y) { return cfl(p, y); }`;
             row('Matrix', inputs.matrix, 'YCbCr matrix the browser used to convert the video to RGB'),
             row('Snap luma', inputs.snap, 'Round recovered luma to the 8-bit code grid, undoing the browser\'s RGB rounding (not in Fast)'),
             row('Dither', inputs.dither, 'Dither output to 8 bits (mpv dithers by default)'),
-            row('Upload', inputs.precision, 'Format the video frame is uploaded into (WebGL2 only; Fast always uses 8-bit)'),
-            row('Renderer', inputs.backend, 'Auto uses WebGL2 when available, otherwise WebGL1'),
+            row('Upload', inputs.precision, 'Format the video frame is uploaded into (WebGL2, and WebGPU where it can\'t read the video directly; Fast always uses 8-bit)'),
+            row('Renderer', inputs.backend, 'Auto uses WebGPU when available, otherwise WebGL2, otherwise WebGL1'),
             row('Split compare', inputs.split, 'Left half original, right half debanded'),
             row('Toggle key', inputs.hotkeyToggle, 'Click, then press the shortcut that turns debanding on and off'),
             row('Panel key', inputs.hotkeyPanel, 'Click, then press the shortcut that opens this panel'),

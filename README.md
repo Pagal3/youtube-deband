@@ -1,6 +1,6 @@
 # YouTube Deband
 
-A userscript that debands YouTube video in the browser using WebGL ports of
+A userscript that debands YouTube video in the browser using WebGPU and WebGL ports of
 [mpv](https://mpv.io/)'s deband shaders, with mpv's own parameters.
 
 - **gpu-next**: [libplacebo](https://code.videolan.org/videolan/libplacebo)
@@ -16,7 +16,8 @@ A userscript that debands YouTube video in the browser using WebGL ports of
 Like mpv, it debands the Y and subsampled CbCr planes separately before color
 conversion: the script undoes the browser's YCbCr→RGB conversion, rebuilds the
 planes, debands each one, converts back and draws on a canvas laid over the
-`<video>`. Runs on WebGL2, with a WebGL1 fallback (e.g. Tor/Mullvad Browser).
+`<video>`. Runs on WebGPU where the browser has it, otherwise WebGL2, otherwise
+WebGL1 (e.g. Tor/Mullvad Browser); see [Renderers](#renderers).
 
 It can also replace the browser's chroma upscaling with a port of
 [GLSL Chroma from Luma (CfL) Prediction](https://github.com/Artoriuz/glsl-chroma-from-luma-prediction)
@@ -76,7 +77,8 @@ to move it (it remembers where); double-click the title bar to put it back.
 | Chroma upscaling | Browser    | `--glsl-shaders=CfL_Prediction.glsl` |
 
 The panel also has the YCbCr matrix (709/601), luma snapping, output dithering,
-upload precision, WebGL backend and a split-screen comparison view.
+upload precision, renderer (WebGPU, WebGL2 or WebGL1) and a split-screen
+comparison view.
 
 ### Presets
 
@@ -125,6 +127,26 @@ the final smoothing pass.
 - Pasting an mpv.conf line that loads either shader into **mpv options**
   picks it.
 
+## Renderers
+
+**Renderer** in the panel picks the graphics API. **Auto** (the default) uses
+WebGPU where the browser has it, otherwise WebGL2, otherwise WebGL1.
+
+- The WebGPU renderer runs the same passes with the shaders ported to WGSL.
+  Given the same frame, gpu-next and CfL produce the same pixels as on WebGL2.
+  gpu and Fast differ by a code value or two in places, because their random
+  numbers come from float hashes that round differently on each API.
+- WebGPU imports the video frame as an external texture instead of uploading
+  a copy. Where a browser can't import video it copies the frame like WebGL2
+  does (in the format set under **Upload**), which costs more.
+- If WebGPU fails while rendering, Auto switches to WebGL until the page is
+  reloaded or a renderer is picked in the panel. If the GPU device is lost
+  (a driver reset, say), it sets up again.
+
+On an NVIDIA Ampere GPU at 720p, both renderers take a few hundredths of a
+millisecond of CPU time per frame and a fraction of a millisecond end to end,
+with WebGL2 slightly ahead. If WebGPU misbehaves on your system, pick WebGL2.
+
 ## Weak hardware
 
 If video stutters with debanding on, click **Fast** under **Mode** at the top
@@ -132,7 +154,8 @@ of the settings panel. It runs the gpu-next algorithm with the same
 parameters, but in one pass straight from the video frame instead of four:
 
 - no intermediate textures and no float textures or WebGL extensions
-- always uploads the frame as 8-bit RGBA, the cheapest upload
+- always uploads the frame as 8-bit RGBA, the cheapest upload (WebGPU imports
+  it instead)
 - a cheap float hash instead of the pcg3d generator, which is slow on
   WebGL1, where it is emulated without integers
 - shaders are only compiled for the mode in use
@@ -157,6 +180,10 @@ WebGL2, and a twentieth on WebGL1.
 | Tor / Mullvad Browser           | WebGL1 fallback; fingerprinting protection limits video to 1080p |
 | WebGL disabled (NoScript, safest security level) | Not supported; the video plays normally        |
 
+Auto renders with WebGPU in Chrome and Edge 113+, Safari 26+ and Firefox 141+
+on Windows, and with WebGL elsewhere. WebGPU has only been tested in
+Chromium; in other browsers the script falls back to WebGL if it fails.
+
 **Userscript managers:** Violentmonkey (recommended), Tampermonkey,
 Greasemonkey, FireMonkey and Userscripts for Safari. The script uses no
 `GM_*` APIs. Settings and your presets are kept in youtube.com's
@@ -169,14 +196,14 @@ are untested, and on mobile there is no DB button.
 **Videos it skips** (it shows a notice, and the video plays undebanded):
 
 - DRM protected video (purchased or rented movies, some Premium content).
-  Browsers don't let WebGL read it.
+  Browsers don't let WebGL or WebGPU read it.
 - HDR (PQ/HLG, BT.2020). Browsers don't give scripts the full HDR signal:
   WebGL receives it cut to 8 bits, and WebGPU receives it already converted
   to SDR, so debanding it would look worse than the video it replaces.
   YouTube sends HDR only to HDR displays, so on an SDR display you get the SDR
   version, which is debanded as usual. Detecting HDR needs WebCodecs
   (`VideoFrame`).
-- Resolutions above the browser's WebGL texture limit.
+- Resolutions above the browser's texture limit.
 
 SD videos encoded as BT.601 need the matrix set to 601 in the panel for exact
 colors. 4K and higher work, but the cost grows with resolution.
