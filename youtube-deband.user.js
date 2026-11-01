@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube Deband (mpv / libplacebo)
 // @namespace    youtube-deband
-// @version      1.13.1
+// @version      1.14.0
 // @description  Debands YouTube video in WebGPU or WebGL using a port of mpv's deband shaders (vo=gpu-next / libplacebo and legacy vo=gpu), with mpv's parameters.
 // @match        *://*.youtube.com/*
 // @match        *://www.youtube-nocookie.com/*
@@ -42,6 +42,10 @@
  *             github.com/Artoriuz/glsl-chroma-from-luma-prediction (MIT,
  *             notice with the port)
  *
+ * Codecs: the player is steered to AV1, VP9 or H.264 by dropping the other
+ * codecs' formats from YouTube's player responses, from a script run in the
+ * page's own JavaScript world (see the Codecs section).
+ *
  * Hotkeys (default): Ctrl+Alt+D toggles debanding, Ctrl+Alt+B opens the
  * settings panel; both can be re-recorded in the panel. The DB button in the
  * player's control bar also opens the panel.
@@ -53,7 +57,8 @@
     const STORAGE_KEY = 'yt-deband-settings';
     const PRESETS_KEY = 'yt-deband-presets'; // the user's own presets, apart so Reset keeps them
     const PANEL_POS_KEY = 'yt-deband-panel-pos'; // where the panel was dragged to, apart so Reset keeps it
-    const VERSION = '1.13.1'; // keep in sync with @version
+    const SWITCH_KEY = 'yt-deband-codec-switch'; // in sessionStorage: { video, codec } switched to for one video
+    const VERSION = '1.14.0'; // keep in sync with @version
 
     // Option ranges match mpv's deband_conf (video/out/gpu/video_shaders.c)
     const DEFAULTS = {
@@ -71,6 +76,7 @@
         precision: 'byte',  // video upload format: 'byte' (RGBA8) | 'half' (RGBA16F); WebGL2 and WebGPU copies.
                             // Browsers hand over the frame as 8-bit RGB, so RGBA16F gains nothing
         backend: 'auto',    // 'auto' | 'webgpu' | 'webgl2' | 'webgl1'
+        codec: 'auto',      // video codec to steer YouTube to: 'auto' (its own pick) | 'av1' | 'vp9' | 'h264'
         hotkeyToggle: 'Ctrl+Alt+d',
         hotkeyPanel: 'Ctrl+Alt+b',
         split: false,       // left half original, right half debanded
@@ -2425,6 +2431,257 @@ fn upscaleChroma(p: vec2f, uv: vec2f, y: f32) -> vec2f { return cfl(p, y); }`;
         controls.prepend(button);
     }
 
+    // ------------------------------------------------------------------
+    // Codecs
+    //
+    // YouTube's player picks AV1, VP9 or H.264 from the formats a video's
+    // player response lists. To make it pick another codec, the formats of
+    // the other codecs are dropped from the response, if the video comes in
+    // the wanted one; videos that don't, play as YouTube picks. A page's
+    // first video comes in ytInitialPlayerResponse, later ones and reloads
+    // from fetching /youtubei/v1/player. Ads don't come either way, so they
+    // play as they would. (Hiding codecs from MediaSource.isTypeSupported
+    // instead also hid them from the ads, which can't be told apart from the
+    // video there, and a pre-roll ad without the codec stalled the player.)
+    //
+    // That has to happen in the page's own JavaScript world, which this
+    // script doesn't run in (@inject-into content), so pageCodecs runs there
+    // from a <script> element. The two halves talk over the DOM, which both
+    // see: pageCodecs reads the settings from storage, puts what a <video>
+    // plays in its data-yt-deband-codec attribute with a yt-deband-codec
+    // event, and reloads a video in place on a yt-deband-reload event.
+    // ------------------------------------------------------------------
+
+    const CODECS = [['av1', 'AV1'], ['vp9', 'VP9'], ['h264', 'H.264']];
+
+    // Runs fn(...args) in the page's JavaScript world. fn goes over as
+    // source, so it can only use its arguments. YouTube's CSP lets an inline
+    // script added from a script run; Trusted Types, which YouTube enforces
+    // in the page's world, want the source from a policy.
+    let scriptPolicy = null;
+    function runInPage(fn, ...args) {
+        const source = `(${fn})(${args.map((a) => JSON.stringify(a)).join(', ')});`;
+        const script = document.createElement('script');
+        try {
+            script.textContent = source;
+        } catch (e) {
+            scriptPolicy = scriptPolicy || trustedTypes.createPolicy('yt-deband', { createScript: (s) => s });
+            script.textContent = scriptPolicy.createScript(source);
+        }
+        document.documentElement.append(script);
+        script.remove();
+    }
+
+    // Steers YouTube's codec choice and reports what each player plays.
+    // Runs in the page's world (see runInPage).
+    function pageCodecs(settingsKey, switchKey) {
+        const MS = window.MediaSource;
+        if (!MS || window.ytDebandCodecs)
+            return;
+        window.ytDebandCodecs = true;
+        const FAMILY = { av01: 'av1', vp9: 'vp9', vp09: 'vp9', avc1: 'h264', avc3: 'h264' };
+        const SAMPLE = {
+            av1: 'video/mp4; codecs="av01.0.08M.08"',
+            vp9: 'video/webm; codecs="vp9"',
+            h264: 'video/mp4; codecs="avc1.4d401f"',
+        };
+        // The codec a video MIME type names ('av1', 'vp9', 'h264' or 'other'
+        // for VP8, HEVC...), or null for audio and types without codecs
+        const family = (type) => {
+            const m = /^\s*video\/[^;]*;.*codecs\s*=\s*"?\s*([a-z0-9]+)/i.exec(type);
+            return m ? FAMILY[m[1].toLowerCase()] || 'other' : null;
+        };
+        const playable = {};
+        const plays = (f) => (f in playable ? playable[f] : (playable[f] = MS.isTypeSupported(SAMPLE[f])));
+        const stored = (storage, key) => {
+            try {
+                return JSON.parse(storage.getItem(key)) || {};
+            } catch (e) {
+                return {};
+            }
+        };
+        // The codecs a player response offers its video in
+        const codecsIn = (response) => {
+            const formats = (response && response.streamingData && response.streamingData.adaptiveFormats) || [];
+            const has = new Set(formats.map((f) => family(f.mimeType)));
+            return Object.keys(SAMPLE).filter((f) => has.has(f));
+        };
+        // By video ID: the codecs it comes in, from before any were dropped,
+        // and whether they were
+        const seen = new Map();
+        // Drops the formats of the codecs other than the one to steer to from
+        // a player response, if the video comes in it and the browser plays
+        // it: the one switched to for this video, else the preferred one.
+        // Returns whether it dropped any.
+        const steer = (response) => {
+            try {
+                const id = response && response.videoDetails && response.videoDetails.videoId;
+                const codecs = codecsIn(response);
+                if (!id || !codecs.length)
+                    return false;
+                const s = stored(sessionStorage, switchKey);
+                const codec = s.video === id ? s.codec : stored(localStorage, settingsKey).codec;
+                const steered = codecs.includes(codec) && plays(codec);
+                seen.set(id, { codecs, steered });
+                if (steered) {
+                    const data = response.streamingData;
+                    data.adaptiveFormats = data.adaptiveFormats.filter((f) => [null, codec].includes(family(f.mimeType)));
+                }
+                return steered;
+            } catch (e) {
+                return false;
+            }
+        };
+
+        // The page's first video. Its inline script assigns this global,
+        // which runs the setter.
+        let initial;
+        Object.defineProperty(window, 'ytInitialPlayerResponse', {
+            configurable: true,
+            get: () => initial,
+            set: (v) => {
+                steer(v);
+                initial = v;
+            },
+        });
+        // Later videos, and the same one again
+        const fetch = window.fetch;
+        window.fetch = function (input) {
+            const pending = fetch.apply(this, arguments);
+            if (!/\/youtubei\/v1\/player\b/.test(input instanceof Request ? input.url : input))
+                return pending;
+            return pending.then((res) => res.clone().json().then((response) => (steer(response)
+                ? new Response(JSON.stringify(response), { status: res.status, statusText: res.statusText, headers: res.headers })
+                : res), () => res));
+        };
+
+        // What a MediaSource's video plays, on the <video> it is attached to
+        // (by object URL; Safari can also attach it as srcObject)
+        const urls = new WeakMap();
+        const createObjectURL = URL.createObjectURL;
+        URL.createObjectURL = function (obj) {
+            const url = createObjectURL.apply(this, arguments);
+            if (obj instanceof MS)
+                urls.set(obj, url);
+            return url;
+        };
+        const report = (source, type) => {
+            try {
+                const f = family(type);
+                const url = source && urls.get(source);
+                const v = f && [...document.querySelectorAll('video')].find((e) => e.srcObject === source || (url && e.src === url));
+                const player = v && v.closest('.html5-video-player');
+                if (!player || !player.getVideoData)
+                    return;
+                const id = player.getVideoData().video_id;
+                const known = seen.get(id) || { codecs: codecsIn(player.getPlayerResponse && player.getPlayerResponse()), steered: false };
+                v.setAttribute('data-yt-deband-codec', JSON.stringify({
+                    codec: /codecs\s*=\s*"?\s*([^",]+)/i.exec(type)[1].trim(),
+                    family: f,
+                    video: id,
+                    offered: known.codecs,
+                    steered: known.steered,
+                    playable: Object.keys(SAMPLE).filter(plays),
+                }));
+                v.dispatchEvent(new Event('yt-deband-codec', { bubbles: true }));
+            } catch (e) { /* only a report */ }
+        };
+        const owners = new WeakMap();
+        const addSourceBuffer = MS.prototype.addSourceBuffer;
+        MS.prototype.addSourceBuffer = function (type) {
+            const buffer = addSourceBuffer.apply(this, arguments);
+            owners.set(buffer, this);
+            report(this, type);
+            return buffer;
+        };
+        const changeType = window.SourceBuffer && SourceBuffer.prototype.changeType;
+        if (changeType) {
+            SourceBuffer.prototype.changeType = function (type) {
+                changeType.apply(this, arguments);
+                report(owners.get(this), type);
+            };
+        }
+
+        // Loads a player's video again where it was, so the player picks its
+        // codec anew; a paused video stays paused
+        document.addEventListener('yt-deband-reload', (e) => {
+            const player = e.target.closest && e.target.closest('.html5-video-player');
+            if (!player || !player.loadVideoById || player.classList.contains('ad-showing'))
+                return;
+            const data = player.getVideoData();
+            const paused = player.getPlayerState() === 2;
+            player.loadVideoById(data.video_id, data.isLive ? undefined : player.getCurrentTime());
+            if (paused) {
+                const since = performance.now();
+                e.target.addEventListener('playing', () => {
+                    if (performance.now() - since < 10000)
+                        player.pauseVideo();
+                }, { once: true });
+            }
+        });
+    }
+
+    try {
+        runInPage(pageCodecs, STORAGE_KEY, SWITCH_KEY);
+    } catch (e) {
+        console.error('[yt-deband] codec switching unavailable:', e);
+    }
+
+    // What the main <video> plays, as pageCodecs put it: { codec (as in its
+    // MIME type), family ('av1', 'vp9', 'h264', 'other'), video (ID),
+    // offered and playable (codec families), steered (whether formats were
+    // dropped) }, or null
+    function codecInfo() {
+        try {
+            return video && JSON.parse(video.getAttribute('data-yt-deband-codec'));
+        } catch (e) {
+            return null;
+        }
+    }
+
+    // The codec just switched to ('auto' for YouTube's pick), until the
+    // player reports its new one
+    let codecSwitching = null;
+
+    // Plays this video in another codec, where it was. Only this video: the
+    // next plays in the preferred codec.
+    function switchCodec(codec) {
+        const info = codecInfo();
+        if (!info || info.family === codec)
+            return;
+        try {
+            sessionStorage.setItem(SWITCH_KEY, JSON.stringify({ video: info.video, codec }));
+        } catch (e) { /* storage blocked */ }
+        codecSwitching = codec;
+        video.dispatchEvent(new Event('yt-deband-reload', { bubbles: true }));
+        refreshPanel();
+    }
+
+    // A new preferred codec drops a switch and applies to this video at once:
+    // it reloads in that codec if it comes in it, or, if not (or Auto) and
+    // it was steered, in what YouTube picks
+    function codecPreferenceChanged() {
+        try {
+            sessionStorage.removeItem(SWITCH_KEY);
+        } catch (e) { /* storage blocked */ }
+        const info = codecInfo();
+        if (!info)
+            return;
+        const codec = settings.codec;
+        const to = info.offered.includes(codec) && info.playable.includes(codec) ? codec : null;
+        if (to ? info.family !== to : info.steered) {
+            codecSwitching = to || 'auto';
+            video.dispatchEvent(new Event('yt-deband-reload', { bubbles: true }));
+        }
+    }
+
+    document.addEventListener('yt-deband-codec', (e) => {
+        if (e.target !== video)
+            return;
+        codecSwitching = null;
+        refreshPanel();
+    }, true);
+
     // YouTube is a single page app and may swap the <video> element
     setInterval(() => {
         ensurePlayerButton();
@@ -2472,6 +2729,8 @@ fn upscaleChroma(p: vec2f, uv: vec2f, y: f32) -> vec2f { return cfl(p, y); }`;
     function applySettings(values) {
         Object.assign(settings, values);
         saveSettings();
+        if ('codec' in values)
+            codecPreferenceChanged();
         refreshPanel();
         // A canvas keeps its first context type, so a backend switch needs a
         // new one. Picking a renderer also gives WebGPU another chance.
@@ -2700,6 +2959,7 @@ button, input, select, textarea { font: inherit; color: inherit; }
 }
 .seg button:hover { background: var(--hover); }
 .seg button[aria-checked="true"] { background: var(--accent); color: #0f0f0f; font-weight: 500; }
+.seg button:disabled { background: transparent; opacity: 0.4; cursor: default; }
 
 input[type="text"], input[type="number"], select, textarea {
     min-width: 0; padding: 6px 9px; background: var(--field); border: 1px solid var(--line); border-radius: 8px;
@@ -2942,6 +3202,47 @@ a:hover { text-decoration: underline; }
             };
             return root;
         };
+        // A button per codec that switches this video to it, the one playing
+        // highlighted, and the codec to prefer for every video
+        const codecPicker = (preferences) => {
+            const buttons = CODECS.map(([c, text]) => el('button', {
+                type: 'button', role: 'radio', textContent: text,
+                onclick: () => switchCodec(c),
+            }));
+            const playing = el('div', { className: 'about' });
+            const select = el('select', {
+                'aria-label': 'Preferred codec',
+                onchange: (e) => applySetting('codec', e.target.value),
+            }, ...preferences.map(([v, text]) => el('option', { value: v, textContent: text })));
+            const about = el('div', { className: 'about' });
+            const root = el('div', null,
+                el('div', { className: 'seg', role: 'radiogroup', 'aria-label': 'This video\'s codec' }, ...buttons),
+                playing,
+                el('div', { className: 'row', style: { marginTop: '10px' } }, el('span', { textContent: 'Preferred' }), select),
+                about);
+            const name = (c) => (CODECS.find(([v]) => v === c) || [, c])[1];
+            root.refresh = (preferred) => {
+                const info = codecInfo();
+                const ad = !!(video && video.closest('.ad-showing'));
+                CODECS.forEach(([c, text], i) => {
+                    const why = !info ? '' : ad ? 'Wait for the ad to end'
+                        : !info.playable.includes(c) ? `This browser can't play ${text}`
+                        : !info.offered.includes(c) ? `This video doesn't come in ${text}` : '';
+                    buttons[i].disabled = !info || !!why;
+                    buttons[i].title = why || (info ? `Play this video in ${text}` : '');
+                    buttons[i].setAttribute('aria-checked', !!info && info.family === c && !codecSwitching);
+                });
+                playing.textContent = codecSwitching ? `Switching to ${codecSwitching === 'auto' ? 'YouTube\'s pick' : name(codecSwitching)}…`
+                    : info ? `Playing ${info.family === 'other' ? info.codec : name(info.family)}. ` +
+                             'The buttons switch this video; the next plays in the preferred codec.'
+                    : video && video.readyState >= 2 ? 'This player doesn\'t say which codec it plays, so it can\'t be switched here.'
+                    : 'Shows the codec once a video plays.';
+                select.value = preferred;
+                about.textContent = preferences.find(([v]) => v === preferred)[2] +
+                    (preferred !== 'auto' ? ' Videos without it play as YouTube picks.' : '');
+            };
+            return root;
+        };
 
         const enabled = toggle('enabled');
         const state = el('span', { className: 'state' });
@@ -2970,6 +3271,12 @@ a:hover { text-decoration: underline; }
                 ['browser', 'Browser', 'The browser\'s own chroma upscaling, usually bilinear: color bleeds a little over sharp edges.'],
                 ['cfl', 'CfL', 'Chroma from Luma prediction: sharper color edges, as with mpv\'s CfL_Prediction.glsl.'],
                 ['cfl-lite', 'CfL Lite', 'CfL_Prediction_Lite.glsl: fewer samples and no smoothing pass. A bit cheaper.'],
+            ]),
+            codec: codecPicker([
+                ['auto', 'Auto', 'YouTube\'s own pick, usually AV1 or VP9.'],
+                ['av1', 'AV1', 'The best picture for the data, but GPUs from before about 2020 leave it to the CPU, which can stutter.'],
+                ['vp9', 'VP9', 'Decoded by the GPU on most systems from 2016 on, and offered up to 4K and beyond.'],
+                ['h264', 'H.264', 'Decoded by the GPU nearly everywhere, but YouTube usually offers it only up to 1080p, and it takes the most data.'],
             ]),
             matrix: choice('matrix', [
                 ['709', 'BT.709', 'The matrix of HD video, and of most video on YouTube.'],
@@ -3046,6 +3353,7 @@ a:hover { text-decoration: underline; }
                 group(null, false,
                     line('Split compare', 'Left half original, right half debanded', inputs.split))),
             picture: el('div', null,
+                group('Codec', false, inputs.codec),
                 group('Chroma upscaling', true, inputs.chroma),
                 group('YCbCr matrix', false, inputs.matrix),
                 group(null, false,

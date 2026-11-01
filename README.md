@@ -15,12 +15,15 @@ stream of Sintel at 0:35, default settings; more in [Comparison](#comparison).</
   **Fastest** modes for weak GPUs and integrated graphics
 - mpv's four deband parameters, presets, and import from your own `mpv.conf`
 - Optional **CfL** chroma upscaling, ported from the shaders mpv users load
+- Switching the video between YouTube's **AV1**, **VP9** and **H.264** streams,
+  and a preferred codec for every video
 - Renders with WebGPU, WebGL2 or WebGL1, so it also runs in Tor and Mullvad Browser
 - A settings panel in the player and a split-screen comparison view
 
 **Contents:** [Install](#install) · [Usage](#usage) · [Comparison](#comparison) ·
-[Modes](#modes) · [Chroma upscaling](#chroma-upscaling) · [Renderers](#renderers) ·
-[Compatibility](#compatibility) · [How it works](#how-it-works) · [License](#license)
+[Modes](#modes) · [Chroma upscaling](#chroma-upscaling) · [Codecs](#codecs) ·
+[Renderers](#renderers) · [Compatibility](#compatibility) · [How it works](#how-it-works) ·
+[License](#license)
 
 ## Install
 
@@ -43,15 +46,15 @@ Both shortcuts can be re-recorded on the panel's **Advanced** tab.
 
 <p>
   <img src="docs/panel-deband.png" width="372" align="top" alt="Settings panel, Deband tab: mode, preset, the four parameters and split compare">
-  <img src="docs/panel-picture.png" width="372" align="top" alt="Settings panel, Picture tab: chroma upscaling, YCbCr matrix, luma snapping and dither">
+  <img src="docs/panel-picture.png" width="372" align="top" alt="Settings panel, Picture tab: codec, chroma upscaling, YCbCr matrix, luma snapping and dither">
 </p>
 
 The panel has three tabs:
 
 - **Deband**: the mode, presets, the four parameters and the split-screen
   comparison
-- **Picture**: chroma upscaling, the YCbCr matrix (709/601), luma snapping and
-  output dithering
+- **Picture**: the video codec, chroma upscaling, the YCbCr matrix (709/601),
+  luma snapping and output dithering
 - **Advanced**: the renderer, upload precision, shortcuts, importing mpv
   options and resetting
 
@@ -223,6 +226,35 @@ the final smoothing pass.
 - An `mpv.conf` pasted into **Import from mpv** that loads either shader
   picks it.
 
+## Codecs
+
+YouTube offers most videos in three codecs, and its player picks one, usually
+AV1 where the browser can decode it and VP9 elsewhere. **Codec** on the
+Picture tab shows which one the video is playing and changes it:
+
+- The **AV1**, **VP9** and **H.264** buttons switch the video you're watching.
+  It carries on from where it was, at the same speed, and stays paused if it
+  was. The switch lasts for that video; the next one plays in the preferred
+  codec. Codecs the video doesn't come in, or the browser can't play, are
+  dimmed, with the reason when you hover over them.
+- **Preferred** picks the codec for every video. Videos that don't come in it
+  play in what YouTube picks, and changing it applies to the video you're
+  watching straight away.
+
+| Codec | Decoded by the GPU on                                   | But                                                                    |
+|-------|---------------------------------------------------------|------------------------------------------------------------------------|
+| AV1   | GPUs from about 2020 on (NVIDIA RTX 30, Intel 11th gen) | Older GPUs leave it to the CPU, which can stutter at high resolutions  |
+| VP9   | Most GPUs from 2016 on                                  | Takes more data than AV1 for the same picture                          |
+| H.264 | Nearly every GPU                                        | YouTube usually offers it only up to 1080p, and it takes the most data |
+
+Debanding works the same on all three. On integrated graphics without AV1
+decoding, VP9 or H.264 leaves it more headroom.
+
+Ads play in whatever YouTube picks for them. The script steers the player by
+removing the other codecs' streams from the list it picks from, and doesn't
+touch what the browser reports it can play, which the ads and YouTube's own
+capability checks rely on.
+
 ## Renderers
 
 **Renderer** on the Advanced tab picks the graphics API. **Auto** (the
@@ -271,7 +303,8 @@ data resets them.
 
 Watch pages, theater mode, fullscreen and embeds (including
 youtube-nocookie.com). YouTube Music is excluded. Shorts and m.youtube.com
-are untested, and on mobile there is no DB button.
+are untested, and on mobile there is no DB button. Codec switching is
+untested in embeds.
 
 ### Videos it skips
 
