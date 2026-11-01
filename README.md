@@ -63,7 +63,8 @@ out to be a few flat blocks of brightness:
 - **Ctrl+Alt+B** or the **DB** button in the player's control bar opens the
   settings panel
 
-Both hotkeys can be re-recorded in the panel.
+Both hotkeys can be re-recorded in the panel. Drag the panel by its title bar
+to move it (it remembers where); double-click the title bar to put it back.
 
 | Setting          | Default    | mpv option                           |
 |------------------|------------|--------------------------------------|

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube Deband (mpv / libplacebo)
 // @namespace    youtube-deband
-// @version      1.9.0
+// @version      1.10.0
 // @description  Debands YouTube video in WebGL2 using a port of mpv's deband shaders (vo=gpu-next / libplacebo and legacy vo=gpu), with mpv's parameters.
 // @match        *://*.youtube.com/*
 // @match        *://www.youtube-nocookie.com/*
@@ -47,7 +47,8 @@
 
     const STORAGE_KEY = 'yt-deband-settings';
     const PRESETS_KEY = 'yt-deband-presets'; // the user's own presets, apart so Reset keeps them
-    const VERSION = '1.9.0'; // keep in sync with @version
+    const PANEL_POS_KEY = 'yt-deband-panel-pos'; // where the panel was dragged to, apart so Reset keeps it
+    const VERSION = '1.10.0'; // keep in sync with @version
 
     // Option ranges match mpv's deband_conf (video/out/gpu/video_shaders.c)
     const DEFAULTS = {
@@ -1746,7 +1747,17 @@ vec2 upscaleChroma(vec2 p, vec2 uv, float y) { return cfl(p, y); }`;
             // Keep YouTube's hotkeys from reacting while typing in the panel
             onkeydown: (e) => e.stopPropagation(),
         },
-            el('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '4px' } },
+            el('div', {
+                style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '4px', cursor: 'move', userSelect: 'none', touchAction: 'none' },
+                title: 'Drag to move the panel; double-click to put it back',
+                onpointerdown: startPanelDrag,
+                ondblclick: (e) => {
+                    if (e.target.closest('button'))
+                        return;
+                    savePanelPos(null);
+                    placePanel();
+                },
+            },
                 el('span', null,
                     el('strong', { textContent: 'Deband' }),
                     el('span', { textContent: ' v' + VERSION, style: { opacity: '0.6', fontSize: '11px' } })),
@@ -1819,7 +1830,76 @@ vec2 upscaleChroma(vec2 p, vec2 uv, float y) { return cfl(p, y); }`;
         panel.root.style.display = visible ? 'block' : 'none';
         refreshPanel();
         panel.status.textContent = status;
+        if (visible)
+            placePanel();
     }
+
+    // The dragged-to position as { left, top } in px, or null for the default
+    // top right corner
+    function loadPanelPos() {
+        try {
+            const p = JSON.parse(localStorage.getItem(PANEL_POS_KEY) || 'null');
+            return p && isFinite(p.left) && isFinite(p.top) ? p : null;
+        } catch (e) {
+            return null;
+        }
+    }
+
+    function savePanelPos(p) {
+        try {
+            if (p)
+                localStorage.setItem(PANEL_POS_KEY, JSON.stringify(p));
+            else
+                localStorage.removeItem(PANEL_POS_KEY);
+        } catch (e) { /* storage blocked, the position lasts until reload */ }
+    }
+
+    // Moves the panel to (left, top), kept wholly inside the window so it
+    // can't be lost off screen; returns where it ended up
+    function movePanel(left, top) {
+        const r = panel.root.getBoundingClientRect();
+        left = Math.round(Math.max(0, Math.min(left, window.innerWidth - r.width)));
+        top = Math.round(Math.max(0, Math.min(top, window.innerHeight - r.height)));
+        Object.assign(panel.root.style, { left: left + 'px', top: top + 'px', right: 'auto' });
+        return { left, top };
+    }
+
+    // Puts the panel at its saved position, or the default one
+    function placePanel() {
+        if (!panel || panel.root.style.display === 'none')
+            return;
+        const p = loadPanelPos();
+        if (p)
+            movePanel(p.left, p.top);
+        else
+            Object.assign(panel.root.style, { left: 'auto', top: '72px', right: '16px' });
+    }
+
+    // Dragging by the header; the position is saved when the drag ends
+    function startPanelDrag(e) {
+        if (e.button !== 0 || e.target.closest('button'))
+            return;
+        e.preventDefault();
+        const header = e.currentTarget;
+        const r = panel.root.getBoundingClientRect();
+        const dx = e.clientX - r.left, dy = e.clientY - r.top;
+        let pos = null;
+        header.setPointerCapture(e.pointerId);
+        const move = (ev) => { pos = movePanel(ev.clientX - dx, ev.clientY - dy); };
+        const end = () => {
+            header.removeEventListener('pointermove', move);
+            header.removeEventListener('pointerup', end);
+            header.removeEventListener('pointercancel', end);
+            if (pos)
+                savePanelPos(pos);
+        };
+        header.addEventListener('pointermove', move);
+        header.addEventListener('pointerup', end);
+        header.addEventListener('pointercancel', end);
+    }
+
+    // Keep the panel on screen when the window shrinks or goes fullscreen
+    window.addEventListener('resize', () => placePanel());
 
     // Hotkeys are stored as the combination the browser reports, e.g.
     // "Ctrl+Alt+d". Matching what was recorded keeps them working where e.key
