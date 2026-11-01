@@ -68,7 +68,8 @@
         matrix: '709',      // YCbCr matrix the browser used to make RGB
         snap: true,         // round the recovered luma to the 8-bit code grid
         dither: true,       // dither the output down to 8 bits like mpv does
-        precision: 'half',  // video upload format: 'half' (RGBA16F) | 'byte' (RGBA8); WebGL2 and WebGPU copies
+        precision: 'byte',  // video upload format: 'byte' (RGBA8) | 'half' (RGBA16F); WebGL2 and WebGPU copies.
+                            // Browsers hand over the frame as 8-bit RGB, so RGBA16F gains nothing
         backend: 'auto',    // 'auto' | 'webgpu' | 'webgl2' | 'webgl1'
         hotkeyToggle: 'Ctrl+Alt+d',
         hotkeyPanel: 'Ctrl+Alt+b',
@@ -2978,8 +2979,8 @@ a:hover { text-decoration: underline; }
                 ['webgl1', 'WebGL1', 'For browsers without WebGL2, such as Tor Browser and Mullvad Browser.'],
             ]),
             precision: choice('precision', [
-                ['half', 'Half float', 'RGBA16F: keeps the frame\'s precision. Used by WebGL2, and by WebGPU where it can\'t import the video.'],
-                ['byte', '8-bit', 'RGBA8: the cheapest upload, and what Fast and Fastest always use.'],
+                ['byte', '8-bit', 'RGBA8: the cheapest upload. Browsers already hand over the frame as 8-bit RGB, so it loses nothing.'],
+                ['half', 'Half float', 'RGBA16F: more memory traffic for no gain, since the frame arrives as 8-bit RGB. In Firefox it even rounds luma slightly worse.'],
             ]),
             hotkeyToggle: hotkey('hotkeyToggle'),
             hotkeyPanel: hotkey('hotkeyPanel'),
