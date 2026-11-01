@@ -2747,6 +2747,8 @@ input[type="range"]:hover::-webkit-slider-thumb { transform: scale(1.15); }
 .line + .line { margin-top: 4px; }
 .text { flex: 1; min-width: 0; }
 .desc { display: block; margin-top: 2px; color: var(--muted); font-size: 12px; }
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
 .switch {
     position: relative; flex: none; width: 36px; height: 20px; padding: 0; border: 0; border-radius: 10px;
     background: rgba(255, 255, 255, 0.25); cursor: pointer; transition: background 0.15s;
@@ -3055,7 +3057,11 @@ input[type="range"]:hover::-webkit-slider-thumb { transform: scale(1.15); }
                     el('div', { className: 'row end' },
                         el('span', { className: 'desc', style: { flex: '1', marginTop: '0' }, textContent: 'Paste your whole mpv.conf, some lines or flags.' }),
                         button('Apply', () => setStatus(parseMpvOptions(mpvText.value)), 'primary'))),
-                group(null, false, el('div', { className: 'row' }, reset))),
+                group(null, false, el('div', { className: 'row' }, reset)),
+                group('About', false,
+                    el('div', { className: 'desc', style: { marginTop: '0' } },
+                        `YouTube Deband ${VERSION} by Pagal3 · `,
+                        el('a', { href: 'https://github.com/Pagal3/youtube-deband', target: '_blank', rel: 'noopener', textContent: 'GitHub' })))),
         };
         const tabNames = [['deband', 'Deband'], ['picture', 'Picture'], ['advanced', 'Advanced']];
         const tabs = tabNames.map(([id, text]) => el('button', {
