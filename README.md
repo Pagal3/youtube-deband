@@ -65,8 +65,13 @@ out to be a few flat blocks of brightness:
 - **Ctrl+Alt+B** or the **DB** button in the player's control bar opens the
   settings panel
 
-Both hotkeys can be re-recorded in the panel. Drag the panel by its title bar
-to move it (it remembers where); double-click the title bar to put it back.
+The panel has three tabs: **Deband** for the mode, presets and the four
+parameters, **Picture** for chroma upscaling and color handling, and
+**Advanced** for the renderer, hotkeys, importing mpv options and resetting.
+The switch in its title bar turns debanding on and off, and Esc closes it.
+Both hotkeys can be re-recorded under **Advanced**. Drag the panel by its
+title bar to move it (it remembers where); double-click the title bar to put
+it back.
 
 | Setting          | Default    | mpv option                           |
 |------------------|------------|--------------------------------------|
@@ -79,7 +84,15 @@ to move it (it remembers where); double-click the title bar to put it back.
 
 The panel also has the YCbCr matrix (709/601), luma snapping, output dithering,
 upload precision, renderer (WebGPU, WebGL2 or WebGL1) and a split-screen
-comparison view.
+comparison view. Settings that Fast and Fastest don't use are dimmed while one
+of them is picked.
+
+The parameter sliders only cover the useful part of mpv's ranges (iterations
+up to 8, threshold up to 256, grain up to 128), while the number fields next to
+them take everything mpv does. Values past the point of diminishing returns
+that mpv's manual describes turn amber with a note on why: more than 4
+iterations, a threshold over 128, grain over 64, or a range over 24 with
+several iterations.
 
 ### Presets
 
@@ -95,11 +108,12 @@ once. The mode and the other settings stay as they are.
 | Aggressive  | 4          | 100       | 8     | 32    | Hard, close-set steps like blocky dark scenes    |
 | Low bitrate | 4          | 128       | 16    | 48    | 480p and below, heavily compressed uploads       |
 
-To make your own, set the values (or paste them with **Apply mpv options**),
-type a name under them and click **Save**. Saving under a name you already
-used updates that preset, and **Delete** next to the list removes the selected
-one. When the values match no preset, the list shows **Custom**. **Reset**
-doesn't remove your presets.
+To make your own, set the values (or paste mpv options under **Import from
+mpv** on the Advanced tab and click **Apply**), type a name under them and
+click **Save**. Saving under a name you already used updates that preset, and
+the bin button next to the list removes the selected one. When the values
+match no preset, the list shows **Custom**. **Reset all settings** doesn't
+remove your presets.
 
 ### Chroma upscaling
 
@@ -125,8 +139,24 @@ the final smoothing pass.
 - mpv runs CfL on the debanded planes. Here it runs on the planes before
   debanding and the deband change is added on top, which saves debanding luma
   into a render target first.
-- Pasting an mpv.conf line that loads either shader into **mpv options**
-  picks it.
+- An mpv.conf pasted into **Import from mpv** that loads either shader picks
+  it.
+
+### Importing from mpv
+
+**Import from mpv** on the Advanced tab takes a whole mpv.conf, a few lines of
+one, or command line flags, and reads them the way mpv does at startup:
+comments are skipped, and profiles only count where a top-level
+`profile=<name>` applies them. Auto profiles (`profile-cond`) are skipped,
+since their conditions can't be checked in a browser. It picks up
+`deband=yes`, the four `deband-*` values, `vo` (`gpu` or `gpu-next` as the mode; Fast and
+Fastest count as gpu-next and stay picked) and `glsl-shaders` (a CfL shader
+as the chroma upscaling). Anything the text doesn't set keeps its value, and
+the status line lists what was applied.
+
+`deband=no` is ignored, so an import never turns debanding off. Configs often
+set it at the top level and turn debanding back on in an auto profile, for
+example one for network streams, which is what YouTube is.
 
 ## Renderers
 

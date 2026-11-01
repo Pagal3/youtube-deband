@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube Deband (mpv / libplacebo)
 // @namespace    youtube-deband
-// @version      1.12.0
+// @version      1.13.0
 // @description  Debands YouTube video in WebGPU or WebGL using a port of mpv's deband shaders (vo=gpu-next / libplacebo and legacy vo=gpu), with mpv's parameters.
 // @match        *://*.youtube.com/*
 // @match        *://www.youtube-nocookie.com/*
@@ -53,7 +53,7 @@
     const STORAGE_KEY = 'yt-deband-settings';
     const PRESETS_KEY = 'yt-deband-presets'; // the user's own presets, apart so Reset keeps them
     const PANEL_POS_KEY = 'yt-deband-panel-pos'; // where the panel was dragged to, apart so Reset keeps it
-    const VERSION = '1.12.0'; // keep in sync with @version
+    const VERSION = '1.13.0'; // keep in sync with @version
 
     // Option ranges match mpv's deband_conf (video/out/gpu/video_shaders.c)
     const DEFAULTS = {
@@ -1993,6 +1993,37 @@ fn upscaleChroma(p: vec2f, uv: vec2f, y: f32) -> vec2f { return cfl(p, y); }`;
         }
         return steps.length > 0 && steps.every((d) => d >= 10);
     })();
+    // Device pixels per CSS pixel, or null until known. The same protection
+    // reports devicePixelRatio as 2 whatever the screen's scaling, which
+    // would put the canvas's edges between device pixels where Firefox draws
+    // it a pixel narrower than the video. A ResizeObserver's device-pixel
+    // size isn't spoofed; a probe a million pixels wide makes that rounded
+    // size exact enough.
+    let devicePixels = null;
+    (() => {
+        const probe = document.createElement('div'), inner = document.createElement('div');
+        probe.style.cssText = 'position: fixed; left: 0; top: 0; width: 0; height: 0; overflow: hidden; visibility: hidden; pointer-events: none';
+        inner.style.cssText = 'width: 1000000px; height: 0';
+        probe.append(inner);
+        try {
+            new ResizeObserver(([entry]) => {
+                const size = entry.devicePixelContentBoxSize?.[0]?.inlineSize;
+                if (!size)
+                    return;
+                devicePixels = size / 1e6;
+                syncBox();
+            }).observe(inner, { box: 'device-pixel-content-box' });
+        } catch {
+            return;
+        }
+        document.documentElement.append(probe);
+    })();
+    // Firefox on Windows shows video through a DirectComposition overlay
+    // scaled to an even number of device pixels each way (NV12 needs it):
+    // one more than the rounded picture when that's odd, the extra cut off
+    // by the box's edge (DCSurfaceVideo::CalculateSwapChainSize). The canvas
+    // follows, or the picture's right or bottom edge moves when toggling.
+    const evenVideoOverlay = /Windows/.test(navigator.userAgent) && /Firefox\//.test(navigator.userAgent);
     // Video frame callbacks in the current second and how many saw
     // presentedFrames skip ahead, and seconds in a row that called for the
     // other render mode
@@ -2005,7 +2036,7 @@ fn upscaleChroma(p: vec2f, uv: vec2f, y: f32) -> vec2f { return cfl(p, y); }`;
     function setStatus(text) {
         status = text;
         if (panel)
-            panel.status.textContent = text;
+            panel.showStatus(text);
         if (text.startsWith('Error') && !(panel && panel.root.style.display !== 'none'))
             showNotice('YouTube Deband: ' + text);
     }
@@ -2222,23 +2253,58 @@ fn upscaleChroma(p: vec2f, uv: vec2f, y: f32) -> vec2f { return cfl(p, y); }`;
         schedule();
     }
 
-    // Mirror the video element's box; YouTube positions it with inline styles.
-    // The box has the aspect ratio of the video's top resolution and the
-    // browser letterboxes each stream into it (object-fit: contain), so a
-    // canvas stretched over the box (fill, a canvas's default) is scaled a
-    // little differently: low resolutions, whose sizes are rounded further
-    // from that ratio, shift visibly toward the edges.
+    // Lay the canvas over exactly where the browser draws the video's picture.
+    // YouTube positions the video element with inline styles, sized to the
+    // aspect ratio of the video's top resolution, and each stream is fitted
+    // into that box with object-fit (contain or cover), so streams whose
+    // rounded size is off that ratio don't fill it exactly. Browsers draw the
+    // picture with its edges rounded to device pixels, but Firefox only
+    // rounds a canvas's origin and keeps its fractional size, so a canvas
+    // given the same object-fit came out a fraction of a pixel larger,
+    // shifting the picture toward the right or bottom edge. So the picture's
+    // rect is worked out here and rounded like the video's, and the canvas
+    // fills it (clipped to the box where cover crops). Fractions of a CSS
+    // pixel matter throughout, so nothing goes through offsetWidth and the
+    // like, which round to whole pixels.
     function syncBox() {
         if (!video || !canvas)
             return;
         const cs = getComputedStyle(video);
+        const box = video.getBoundingClientRect();
+        const vw = video.videoWidth, vh = video.videoHeight;
+        let w = box.width, h = box.height;
+        if (vw && vh && cs.objectFit !== 'fill') {
+            const fit = cs.objectFit === 'cover' ? Math.max : Math.min;
+            let scale = cs.objectFit === 'none' ? 1 : fit(box.width / vw, box.height / vh);
+            if (cs.objectFit === 'scale-down')
+                scale = Math.min(1, scale);
+            w = vw * scale;
+            h = vh * scale;
+        }
+        // object-position computes to "<x> <y>" in percentages or pixels
+        const [px, py] = cs.objectPosition.split(' ');
+        const offset = (v, free) => (v && v.endsWith('%') ? free * parseFloat(v) / 100
+            : v && v.endsWith('px') ? parseFloat(v) : free / 2);
+        const dpr = devicePixels || window.devicePixelRatio || 1;
+        const device = (v) => Math.round(v * dpr);
+        const snap = (v) => device(v) / dpr;
+        const x = box.left + offset(px, box.width - w), y = box.top + offset(py, box.height - h);
+        const [l, t, r, b] = [x, y, x + w, y + h].map(device);
+        const left = l / dpr, top = t / dpr;
+        const right = (evenVideoOverlay ? r + (r - l) % 2 : r) / dpr;
+        const bottom = (evenVideoOverlay ? b + (b - t) % 2 : b) / dpr;
+        // Where the box is, in the coordinates the canvas is positioned in
+        const boxLeft = cs.left.endsWith('px') ? parseFloat(cs.left) : video.offsetLeft;
+        const boxTop = cs.top.endsWith('px') ? parseFloat(cs.top) : video.offsetTop;
+        // The box clips the picture where cover crops; that edge is rounded too
+        const clip = [snap(box.top) - top, right - snap(box.right), bottom - snap(box.bottom), snap(box.left) - left]
+            .map((v) => Math.max(0, v));
         Object.assign(canvas.style, {
-            left: video.offsetLeft + 'px',
-            top: video.offsetTop + 'px',
-            width: video.offsetWidth + 'px',
-            height: video.offsetHeight + 'px',
-            objectFit: cs.objectFit,
-            objectPosition: cs.objectPosition,
+            left: boxLeft + left - box.left + 'px',
+            top: boxTop + top - box.top + 'px',
+            width: right - left + 'px',
+            height: bottom - top + 'px',
+            clipPath: clip.some((v) => v > 0) ? `inset(${clip.map((v) => v + 'px').join(' ')})` : '',
         });
     }
     document.addEventListener('fullscreenchange', syncBox);
@@ -2382,6 +2448,8 @@ fn upscaleChroma(p: vec2f, uv: vec2f, y: f32) -> vec2f { return cfl(p, y); }`;
                     Object.assign(e.style, v);
                 else if (k.startsWith('on'))
                     e.addEventListener(k.slice(2), v);
+                else if (k === 'role' || k.startsWith('aria-'))
+                    e.setAttribute(k, v);
                 else
                     e[k] = v;
             }
@@ -2446,126 +2514,411 @@ fn upscaleChroma(p: vec2f, uv: vec2f, y: f32) -> vec2f { return cfl(p, y); }`;
         refreshPanel();
     }
 
-    // Accepts mpv.conf lines or command line flags, e.g.
-    // "deband-iterations=2" or "--deband-threshold=35 --deband-grain=16".
-    // A line loading either CfL shader picks that chroma upscaling.
-    function parseMpvOptions(text) {
-        const re = /(?:--)?deband-(iterations|threshold|range|grain)\s*=\s*(-?[\d.]+)/g;
-        let m, n = 0;
-        while ((m = re.exec(text))) {
-            const [lo, hi] = LIMITS[m[1]];
-            let v = Math.min(hi, Math.max(lo, parseFloat(m[2])));
-            if (m[1] === 'iterations')
-                v = Math.round(v);
-            settings[m[1]] = v;
-            n++;
-        }
-        const shader = /(?:^|\s)(?:--)?glsl-shaders?(?:-append)?\s*=.*CfL_Prediction(_Lite)?\.glsl/i.exec(text);
-        if (shader) {
-            settings.chroma = shader[1] ? 'cfl-lite' : 'cfl';
-            n++;
-        }
-        if (/(?:^|\s)(?:--)?deband\s*=\s*no\b/.test(text))
-            settings.enabled = false;
-        else if (/(?:^|\s)(?:--)?deband(?:\s*=\s*yes)?(?:\s|$)/.test(text))
-            settings.enabled = true;
-        saveSettings();
-        refreshPanel();
-        requestRender();
-        return n;
+    // One line of mpv.conf as [[option, value or null]], following mpv's
+    // options/parse_configfile.c: # starts a comment outside quotes, values
+    // may be "quoted", 'quoted' or %length%quoted. A line of command line
+    // flags ("--deband-threshold=35 --deband-grain=16") gives each of them.
+    function mpvLineOptions(line) {
+        line = line.trim();
+        if (/^--\S+\s+--/.test(line))
+            return line.split(/\s+(?=--)/).flatMap(mpvLineOptions);
+        const m = /^(?:--)?([\w-]+)\s*(?:=\s*(?:"([^"]*)"\s*(?:#.*)?|'([^']*)'\s*(?:#.*)?|%(\d+)%(.*)|(.*))|(?:#.*)?)$/.exec(line);
+        if (!m)
+            return []; // blank, a comment or not an option
+        let value = m[2] ?? m[3] ?? null;
+        if (m[4] !== undefined)
+            value = m[5].slice(0, +m[4]);
+        else if (m[6] !== undefined)
+            value = m[6].split('#')[0].trim(); // unquoted: up to the comment
+        return [[m[1], value]];
     }
 
-    function buildPanel() {
-        const row = (label, input, hint) => el('label', {
-            style: { display: 'grid', gridTemplateColumns: '110px 1fr', alignItems: 'center', gap: '8px', margin: '6px 0' },
-            title: hint || '',
-        }, el('span', null, label), input);
+    // Applies mpv.conf text or command line flags the way mpv would at
+    // startup: deband=yes, the four deband-* values, vo (gpu or gpu-next as the
+    // mode; Fast and Fastest count as gpu-next and stay) and glsl-shaders
+    // (a CfL shader as the chroma upscaling). Profiles only count where a
+    // top-level profile=<name> applies them; auto profiles are skipped, as
+    // their conditions can't be checked here. Options the text doesn't set
+    // keep their values. Returns a summary for the status line.
+    function parseMpvOptions(text) {
+        const top = [];
+        const profiles = new Map();
+        let section = top;
+        for (const line of text.replace(/^﻿/, '').split(/\r?\n/)) {
+            const header = /^\s*\[([^\]]*)\]\s*(?:#.*)?$/.exec(line);
+            if (header) {
+                const name = header[1];
+                section = name === 'default' ? top : profiles.get(name) || [];
+                if (name !== 'default')
+                    profiles.set(name, section);
+            } else {
+                section.push(...mpvLineOptions(line));
+            }
+        }
 
-        const inputStyle = {
-            background: '#222', color: '#eee', border: '1px solid #444', borderRadius: '4px',
-            padding: '3px 6px', font: 'inherit', width: '100%', boxSizing: 'border-box',
-        };
-        const number = (key, step) => el('input', {
-            type: 'number', step, min: LIMITS[key][0], max: LIMITS[key][1], style: inputStyle,
-            onchange: (e) => {
-                const [lo, hi] = LIMITS[key];
-                let v = parseFloat(e.target.value);
-                if (!isFinite(v)) v = DEFAULTS[key];
-                v = Math.min(hi, Math.max(lo, key === 'iterations' ? Math.round(v) : v));
-                applySetting(key, v);
-            },
-        });
-        const check = (key) => el('input', {
-            type: 'checkbox', style: { justifySelf: 'start' },
-            onchange: (e) => applySetting(key, e.target.checked),
-        });
-        // Click, then press the combination; Escape cancels
-        const hotkey = (key) => el('input', {
-            type: 'text', readOnly: true, style: Object.assign({}, inputStyle, { cursor: 'pointer' }),
-            onfocus: (e) => { e.target.value = 'Press keys… (Esc cancels)'; },
-            onblur: () => refreshPanel(),
-            onkeydown: (e) => {
-                e.preventDefault();
-                e.stopPropagation();
-                if (e.key === 'Escape') {
-                    e.target.blur();
-                    return;
+        const values = {};
+        let shaders = null; // the glsl-shaders list, once the text touches it
+        const used = new Set();
+        const run = (options, depth) => {
+            for (let [name, value] of options) {
+                // Flags take no-name for name=no
+                if (name.startsWith('no-') && value === null) {
+                    name = name.slice(3);
+                    value = 'no';
                 }
-                const combo = comboFromEvent(e);
-                if (!combo)
-                    return;
-                e.target.blur();
-                applySetting(key, combo);
-            },
+                const param = /^deband-(iterations|threshold|range|grain)$/.exec(name);
+                if (name === 'deband') {
+                    if (value === null || value === 'yes' || value === 'no')
+                        values.enabled = value !== 'no';
+                } else if (param && isFinite(parseFloat(value))) {
+                    const [lo, hi] = LIMITS[param[1]];
+                    const v = Math.min(hi, Math.max(lo, parseFloat(value)));
+                    values[param[1]] = param[1] === 'iterations' ? Math.round(v) : v;
+                } else if (name === 'vo' && value !== null) {
+                    values.vo = value.split(',')[0].trim();
+                } else if (name === 'glsl-shaders' && value !== null) {
+                    // Paths are separated by ; on Windows and : elsewhere
+                    shaders = value.split(/;|:(?![\\/])/).map((s) => s.trim()).filter(Boolean);
+                } else if (/^glsl-shaders?(-append|-add)?$/.test(name) && value !== null) {
+                    shaders = (shaders || []).concat(value);
+                } else if (name === 'glsl-shaders-pre' && value !== null) {
+                    shaders = [value].concat(shaders || []);
+                } else if (name === 'glsl-shaders-clr') {
+                    shaders = [];
+                } else if (name === 'glsl-shaders-remove' && value !== null) {
+                    shaders = (shaders || []).filter((s) => s !== value);
+                } else if (name === 'glsl-shaders-toggle' && value !== null) {
+                    shaders = (shaders || []).includes(value) ? shaders.filter((s) => s !== value) : (shaders || []).concat(value);
+                } else if (name === 'profile' && value !== null && depth < 10) {
+                    // Built-in profiles (high-quality, fast...) don't touch these
+                    for (const p of value.split(',').map((s) => s.trim())) {
+                        if (profiles.has(p)) {
+                            used.add(p);
+                            run(profiles.get(p), depth + 1);
+                        }
+                    }
+                }
+            }
+        };
+        run(top, 0);
+
+        const applied = [];
+        const changes = {};
+        // deband=no is ignored: an mpv.conf often has it at the top with an
+        // auto profile turning debanding back on for some videos (streams,
+        // say), which can't be told apart here
+        if (values.enabled) {
+            changes.enabled = true;
+            applied.push('deband=yes');
+        }
+        for (const k of PRESET_KEYS) {
+            if (k in values) {
+                changes[k] = values[k];
+                applied.push(`deband-${k}=${values[k]}`);
+            }
+        }
+        if (values.vo === 'gpu' || values.vo === 'gpu-next') {
+            const nextLike = settings.algo === 'fast' || settings.algo === 'fastest';
+            changes.algo = values.vo === 'gpu' ? 'gpu' : nextLike ? settings.algo : 'gpu-next';
+            applied.push('vo=' + values.vo);
+        }
+        if (shaders) {
+            const cfl = shaders.map((s) => /CfL_Prediction(_Lite)?\.glsl$/i.exec(s)).find(Boolean);
+            changes.chroma = !cfl ? 'browser' : cfl[1] ? 'cfl-lite' : 'cfl';
+            applied.push(cfl ? (cfl[1] ? 'CfL Lite' : 'CfL') + ' shader' : 'browser chroma (no CfL shader)');
+        }
+        applySettings(changes);
+
+        const skipped = profiles.size - used.size;
+        return (applied.length ? 'Applied ' + applied.join(', ') : 'Found no deband, vo or shader options') +
+               (used.size ? ` (with profile ${[...used].join(', ')})` : '') +
+               (values.enabled === false ? '; ignored deband=no' : '') +
+               (skipped ? `; skipped ${skipped} profile${skipped === 1 ? '' : 's'} not applied at the top level` : '');
+    }
+
+    // The panel lives in a shadow root, so YouTube's styles don't reach it and
+    // these don't leak out. YouTube sets no style-src, so a <style> is allowed.
+    const PANEL_CSS = `
+:host { all: initial; color-scheme: dark; }
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+.panel {
+    --line: rgba(255, 255, 255, 0.1); --field: rgba(0, 0, 0, 0.35); --raised: rgba(255, 255, 255, 0.08);
+    --hover: rgba(255, 255, 255, 0.14); --text: #f1f1f1; --muted: #aaa; --accent: #3ea6ff;
+    --ok: #2ba640; --warn: #f2a33a; --error: #ff6b63;
+    display: flex; flex-direction: column; width: 340px; max-width: calc(100vw - 32px); max-height: calc(100vh - 88px);
+    overflow: hidden; background: rgba(28, 28, 28, 0.97); color: var(--text);
+    border: 1px solid var(--line); border-radius: 12px; box-shadow: 0 12px 40px rgba(0, 0, 0, 0.55);
+    font: 13px/1.4 Roboto, Arial, system-ui, sans-serif;
+}
+button, input, select, textarea { font: inherit; color: inherit; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+.head { display: flex; align-items: center; gap: 10px; padding: 12px 10px 10px 14px; cursor: move; user-select: none; touch-action: none; }
+.logo {
+    flex: none; width: 22px; height: 22px; border-radius: 6px;
+    background: linear-gradient(#8ccbff 0 25%, #4fadff 25% 50%, #2584e6 50% 75%, #1660bd 75%) left / 50% 100% no-repeat,
+                linear-gradient(#8ccbff, #1660bd) right / 50% 100% no-repeat;
+}
+.title { flex: 1; min-width: 0; font-size: 15px; font-weight: 500; white-space: nowrap; }
+.version { margin-left: 6px; color: var(--muted); font-size: 11px; font-weight: 400; }
+.state { min-width: 22px; color: var(--muted); font-size: 12px; text-align: right; }
+.icon {
+    display: grid; place-items: center; flex: none; width: 30px; height: 30px; padding: 0;
+    border: 0; border-radius: 50%; background: transparent; color: var(--muted); cursor: pointer;
+}
+.icon:hover { background: var(--hover); color: var(--text); }
+.icon svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+
+.tabs { display: flex; padding: 0 8px; border-bottom: 1px solid var(--line); }
+.tab {
+    flex: 1; padding: 8px 0 9px; margin-bottom: -1px; border: 0; border-bottom: 2px solid transparent;
+    background: none; color: var(--muted); font-weight: 500; cursor: pointer;
+}
+.tab:hover { color: var(--text); }
+.tab[aria-selected="true"] { color: var(--text); border-bottom-color: var(--accent); }
+
+.body { flex: 1; min-height: 0; overflow-y: auto; padding: 0 14px; scrollbar-width: thin; scrollbar-color: rgba(255, 255, 255, 0.2) transparent; }
+.group { padding: 12px 0; border-bottom: 1px solid var(--line); }
+.group:last-child { border-bottom: 0; }
+.label { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; margin-bottom: 8px; font-weight: 500; }
+.about { min-height: 2.8em; margin-top: 8px; color: var(--muted); font-size: 12px; }
+.only { display: none; color: var(--warn); font-size: 11px; font-weight: 400; }
+.fast .full-only { opacity: 0.55; }
+.fast .only { display: inline; }
+
+.seg { display: flex; gap: 3px; padding: 3px; background: var(--field); border: 1px solid var(--line); border-radius: 9px; }
+.seg button {
+    flex: 1; min-width: 0; padding: 6px 4px; border: 0; border-radius: 6px; background: transparent;
+    white-space: nowrap; cursor: pointer; transition: background 0.15s, color 0.15s;
+}
+.seg button:hover { background: var(--hover); }
+.seg button[aria-checked="true"] { background: var(--accent); color: #0f0f0f; font-weight: 500; }
+
+input[type="text"], input[type="number"], select, textarea {
+    min-width: 0; padding: 6px 9px; background: var(--field); border: 1px solid var(--line); border-radius: 8px;
+    outline: none; transition: border-color 0.15s;
+}
+input:focus, select:focus, textarea:focus { border-color: var(--accent); }
+::placeholder { color: #777; }
+select {
+    appearance: none; padding-right: 28px; cursor: pointer;
+    background: var(--field) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'%3E%3Cpath d='M3 4.5l3 3 3-3' fill='none' stroke='%23aaa' stroke-width='1.5'/%3E%3C/svg%3E") right 9px center / 12px no-repeat;
+}
+option, optgroup { background: #282828; }
+textarea { width: 100%; resize: vertical; font: 12px/1.5 ui-monospace, Consolas, monospace; }
+
+.btn {
+    flex: none; padding: 6px 14px; border: 0; border-radius: 18px; background: var(--raised);
+    font-weight: 500; white-space: nowrap; cursor: pointer; transition: background 0.15s;
+}
+.btn:hover { background: var(--hover); }
+.btn.primary { background: var(--accent); color: #0f0f0f; }
+.btn.primary:hover { background: #65b8ff; }
+.btn.danger { color: var(--error); }
+.btn.danger.armed { background: var(--error); color: #fff; }
+
+.row { display: flex; align-items: center; gap: 8px; }
+.row > select, .row > input { flex: 1; }
+.end { justify-content: flex-end; margin-top: 8px; }
+
+.param { display: grid; grid-template-columns: 70px 1fr 56px; align-items: center; gap: 10px; margin: 4px 0; }
+.param input[type="number"] { width: 100%; padding: 4px 6px; text-align: right; appearance: textfield; -moz-appearance: textfield; }
+.param.over { --accent: var(--warn); }
+.param.over input[type="number"] { border-color: var(--warn); color: var(--warn); }
+.advice { margin-top: 8px; padding: 8px 10px; border-radius: 8px; background: rgba(242, 163, 58, 0.1); color: var(--warn); font-size: 12px; }
+.advice div + div { margin-top: 4px; }
+.param input::-webkit-inner-spin-button, .param input::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
+input[type="range"] { width: 100%; height: 20px; margin: 0; background: transparent; cursor: pointer; -webkit-appearance: none; appearance: none; }
+input[type="range"]::-webkit-slider-runnable-track {
+    height: 4px; border-radius: 2px;
+    background: linear-gradient(to right, var(--accent) calc(7px + var(--f, 0) * (100% - 14px)), rgba(255, 255, 255, 0.2) 0);
+}
+input[type="range"]::-webkit-slider-thumb {
+    width: 14px; height: 14px; margin-top: -5px; border-radius: 50%; background: #fff;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.5); transition: transform 0.1s; -webkit-appearance: none;
+}
+input[type="range"]::-moz-range-track { height: 4px; border-radius: 2px; background: rgba(255, 255, 255, 0.2); }
+input[type="range"]::-moz-range-progress { height: 4px; border-radius: 2px; background: var(--accent); }
+input[type="range"]::-moz-range-thumb { width: 14px; height: 14px; border: 0; border-radius: 50%; background: #fff; box-shadow: 0 1px 3px rgba(0, 0, 0, 0.5); }
+input[type="range"]:hover::-webkit-slider-thumb { transform: scale(1.15); }
+
+.line { display: flex; align-items: center; gap: 12px; padding: 7px 0; cursor: pointer; }
+.line + .line { margin-top: 4px; }
+.text { flex: 1; min-width: 0; }
+.desc { display: block; margin-top: 2px; color: var(--muted); font-size: 12px; }
+.switch {
+    position: relative; flex: none; width: 36px; height: 20px; padding: 0; border: 0; border-radius: 10px;
+    background: rgba(255, 255, 255, 0.25); cursor: pointer; transition: background 0.15s;
+}
+.switch::after {
+    content: ''; position: absolute; top: 2px; left: 2px; width: 16px; height: 16px; border-radius: 50%;
+    background: #fff; box-shadow: 0 1px 2px rgba(0, 0, 0, 0.4); transition: transform 0.15s;
+}
+.switch[aria-checked="true"] { background: var(--accent); }
+.switch[aria-checked="true"]::after { transform: translateX(16px); }
+.key { flex: none; width: 128px; text-align: center; font-weight: 500; cursor: pointer; caret-color: transparent; }
+.key:focus { color: var(--accent); }
+
+.status {
+    display: flex; align-items: flex-start; gap: 8px; padding: 9px 14px; border-top: 1px solid var(--line);
+    background: rgba(0, 0, 0, 0.25); color: var(--muted); font-size: 11.5px; overflow-wrap: anywhere;
+}
+.dot { flex: none; width: 8px; height: 8px; margin-top: 4px; border-radius: 50%; background: #717171; }
+.status.ok .dot { background: var(--ok); box-shadow: 0 0 6px var(--ok); }
+.status.warn .dot { background: var(--warn); }
+.status.warn { color: var(--warn); }
+.status.error .dot { background: var(--error); }
+.status.error { color: var(--error); }
+`;
+
+    // Upper ends of the sliders where mpv's range is far wider than useful;
+    // the number fields still take the full range
+    const SLIDER_TOP = { iterations: 8, threshold: 256, grain: 128 };
+    // Values past the point of diminishing returns (mpv's manual), flagged
+    // with why; no preset trips these
+    const PARAM_ADVICE = [
+        ['iterations', (s) => s.iterations > 4, 'Past 4 iterations each step adds almost nothing but still costs GPU time.'],
+        ['threshold', (s) => s.threshold > 128, 'Thresholds past 128 erase fine detail along with the banding.'],
+        ['grain', (s) => s.grain > 64, 'Grain past 64 shows as visible noise.'],
+        ['range', (s) => s.iterations > 1 && s.range > 24, 'The radius grows with each iteration, so with several a lower range usually works better.'],
+    ];
+
+    // "Ctrl+Alt+d" as "Ctrl + Alt + D"
+    const formatCombo = (combo) => (combo.match(/[^+]+|\+$/g) || [])
+        .map((p) => (p.length === 1 ? p.toUpperCase() : p)).join(' + ');
+
+    function buildPanel() {
+        const svg = (d) => {
+            const NS = 'http://www.w3.org/2000/svg';
+            const s = document.createElementNS(NS, 'svg');
+            s.setAttribute('viewBox', '0 0 24 24');
+            const path = document.createElementNS(NS, 'path');
+            path.setAttribute('d', d);
+            s.append(path);
+            return s;
+        };
+        const iconButton = (d, title, onclick) => el('button', { type: 'button', className: 'icon', title, 'aria-label': title, onclick }, svg(d));
+        const button = (text, onclick, kind) => el('button', {
+            type: 'button', className: kind ? 'btn ' + kind : 'btn', textContent: text, onclick,
         });
-        const select = (key, options) => el('select', {
-            style: inputStyle, onchange: (e) => applySetting(key, e.target.value),
-        }, ...options.map(([v, t]) => el('option', { value: v, textContent: t })));
+        // A titled block of the panel. Settings Fast and Fastest ignore are
+        // dimmed while one of them is picked.
+        const group = (title, fullOnly, ...content) => el('div', { className: fullOnly ? 'group full-only' : 'group' },
+            ...(title ? [el('div', { className: 'label' },
+                el('span', { textContent: title }),
+                ...(fullOnly ? [el('span', { className: 'only', textContent: 'Not used by Fast and Fastest' })] : []))] : []),
+            ...content);
+        // A setting with its description on the left and its control on the
+        // right; clicking anywhere on it works the control
+        const line = (title, desc, control, fullOnly) => el('label', { className: fullOnly ? 'line full-only' : 'line' },
+            el('span', { className: 'text' },
+                el('span', { textContent: title }),
+                ...(fullOnly ? [el('span', { className: 'only', textContent: ' · Not used by Fast and Fastest' })] : []),
+                el('span', { className: 'desc', textContent: desc })),
+            control);
+
+        const toggle = (key) => {
+            const sw = el('button', {
+                type: 'button', className: 'switch', role: 'switch',
+                onclick: () => applySetting(key, !settings[key]),
+            });
+            sw.refresh = (on) => sw.setAttribute('aria-checked', !!on);
+            return sw;
+        };
+        // A slider and a number field for one deband parameter
+        const param = (key, title) => {
+            const [lo, hi] = LIMITS[key];
+            const top = Math.min(hi, SLIDER_TOP[key] || hi);
+            const clamp = (v) => Math.min(hi, Math.max(lo, key === 'iterations' ? Math.round(v) : v));
+            const slider = el('input', {
+                type: 'range', min: lo, max: top, step: 1, 'aria-label': title,
+                oninput: (e) => applySetting(key, clamp(parseFloat(e.target.value))),
+            });
+            const number = el('input', {
+                type: 'number', min: lo, max: hi, step: 1, 'aria-label': title,
+                onchange: (e) => {
+                    const v = parseFloat(e.target.value);
+                    applySetting(key, clamp(isFinite(v) ? v : DEFAULTS[key]));
+                },
+            });
+            const row = el('div', { className: 'param', title: `--deband-${key}=<${lo}..${hi}> (default ${DEFAULTS[key]})` },
+                el('span', { textContent: title }), slider, number);
+            row.refresh = (v) => {
+                const s = Math.min(v, top);
+                slider.value = s;
+                slider.style.setProperty('--f', (s - lo) / (top - lo));
+                number.value = v;
+                row.classList.toggle('over', PARAM_ADVICE.some(([k, over]) => k === key && over(settings)));
+            };
+            return row;
+        };
+        // Why the values flagged above aren't worth it
+        const advice = el('div', { className: 'advice' });
+        advice.refresh = () => {
+            const notes = PARAM_ADVICE.filter(([, over]) => over(settings));
+            advice.replaceChildren(...notes.map(([, , text]) => el('div', { textContent: text })));
+            advice.hidden = !notes.length;
+        };
+        // Click, then press the combination; Escape cancels
+        const hotkey = (key) => {
+            const input = el('input', {
+                type: 'text', readOnly: true, className: 'key',
+                onfocus: (e) => { e.target.value = 'Press keys…'; },
+                onblur: () => refreshPanel(),
+                onkeydown: (e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    if (e.key === 'Escape') {
+                        e.target.blur();
+                        return;
+                    }
+                    const combo = comboFromEvent(e);
+                    if (!combo)
+                        return;
+                    e.target.blur();
+                    applySetting(key, combo);
+                },
+            });
+            input.refresh = (combo) => {
+                if (input.getRootNode().activeElement !== input)
+                    input.value = formatCombo(combo);
+            };
+            return input;
+        };
         // A button per option, the selected one highlighted, with what it
         // does written underneath
         const choice = (key, options) => {
             const buttons = options.map(([v, text, about]) => el('button', {
-                type: 'button', textContent: text, title: about,
-                style: { flex: '1', border: '1px solid #444', borderRadius: '4px', padding: '5px 4px', cursor: 'pointer', font: 'inherit' },
+                type: 'button', role: 'radio', textContent: text, title: about,
                 onclick: () => applySetting(key, v),
             }));
-            const about = el('div', { style: { opacity: '0.7', fontSize: '11px', marginTop: '4px', minHeight: '2.8em' } });
-            const root = el('div', { role: 'radiogroup' },
-                el('div', { style: { display: 'flex', gap: '4px' } }, ...buttons), about);
+            const about = el('div', { className: 'about' });
+            const root = el('div', null, el('div', { className: 'seg', role: 'radiogroup' }, ...buttons), about);
             root.refresh = (value) => options.forEach(([v, , text], i) => {
-                const on = v === value;
-                buttons[i].setAttribute('aria-checked', on);
-                buttons[i].setAttribute('role', 'radio');
-                Object.assign(buttons[i].style, on
-                    ? { background: '#3ea6ff', color: '#0f0f0f', fontWeight: 'bold', borderColor: '#3ea6ff' }
-                    : { background: '#222', color: '#eee', fontWeight: 'normal', borderColor: '#444' });
-                if (on)
+                buttons[i].setAttribute('aria-checked', v === value);
+                if (v === value)
                     about.textContent = text;
             });
             return root;
         };
-        const button = (text, onclick) => el('button', {
-            textContent: text, onclick,
-            style: { background: '#333', color: '#eee', border: '1px solid #555', borderRadius: '4px', padding: '4px 10px', cursor: 'pointer', font: 'inherit' },
-        });
         // The preset list, with Delete for the user's own presets and what the
         // picked one is for written underneath. Values that match no preset
         // show as Custom.
         const presetPicker = () => {
             const select = el('select', {
-                style: Object.assign({}, inputStyle, { flex: '1', minWidth: '0' }),
+                'aria-label': 'Preset',
                 onchange: (e) => applyPreset(e.target.value),
             });
-            const del = button('Delete', () => {
+            const del = iconButton('M4 7h16M10 11v6M14 11v6M5 7l1 13h12l1-13M9 7V4h6v3', 'Delete this preset', () => {
                 const active = activePreset();
                 if (customPresets.includes(active)) {
                     deletePreset(active.name);
                     setStatus(`Deleted preset ${active.name}`);
                 }
             });
-            del.title = 'Delete the selected preset (only your own)';
-            const about = el('div', { style: { opacity: '0.7', fontSize: '11px', marginTop: '4px', minHeight: '2.8em' } });
-            const root = el('div', null, el('div', { style: { display: 'flex', gap: '8px' } }, select, del), about);
+            const about = el('div', { className: 'about' });
+            const root = el('div', null, el('div', { className: 'row' }, select, del), about);
             root.refresh = () => {
                 const active = activePreset();
                 const own = customPresets.includes(active);
@@ -2575,18 +2928,24 @@ fn upscaleChroma(p: vec2f, uv: vec2f, y: f32) -> vec2f { return cfl(p, y); }`;
                     el('optgroup', { label: 'Built-in' }, ...FACTORY_PRESETS.map(option)),
                     ...(customPresets.length ? [el('optgroup', { label: 'Yours' }, ...customPresets.map(option))] : []));
                 select.value = active ? active.name : '';
-                about.textContent = !active ? 'These values aren\'t a preset. Type a name below and click Save to keep them.'
+                about.textContent = !active ? 'These values aren\'t a preset. Name them below and click Save to keep them.'
                     : own ? 'One of your presets.' : active.about;
-                del.disabled = !own;
-                Object.assign(del.style, { opacity: own ? '' : '0.4', cursor: own ? 'pointer' : 'default' });
+                del.hidden = !own;
             };
             return root;
         };
-        const section = (title, content) => el('div', { style: { margin: '10px 0 6px' } },
-            el('div', { textContent: title, style: { marginBottom: '4px' } }), content);
+
+        const enabled = toggle('enabled');
+        const state = el('span', { className: 'state' });
+        const refreshEnabled = enabled.refresh;
+        enabled.refresh = (on) => {
+            refreshEnabled(on);
+            state.textContent = on ? 'On' : 'Off';
+            enabled.title = `Turn debanding ${on ? 'off' : 'on'} (${formatCombo(settings.hotkeyToggle)})`;
+        };
 
         const inputs = {
-            enabled: check('enabled'),
+            enabled,
             algo: choice('algo', [
                 ['gpu-next', 'gpu-next', 'mpv\'s default: vo=gpu-next debanding (libplacebo).'],
                 ['gpu', 'gpu', 'mpv\'s older vo=gpu debanding shader.'],
@@ -2594,32 +2953,38 @@ fn upscaleChroma(p: vec2f, uv: vec2f, y: f32) -> vec2f { return cfl(p, y); }`;
                 ['fastest', 'Fastest', 'For integrated graphics: Fast worked out at half resolution, a quarter to a third of its debanding work. Leaves the finest streaks.'],
             ]),
             preset: presetPicker(),
+            iterations: param('iterations', 'Iterations'),
+            threshold: param('threshold', 'Threshold'),
+            range: param('range', 'Range'),
+            grain: param('grain', 'Grain'),
+            split: toggle('split'),
             chroma: choice('chroma', [
                 ['browser', 'Browser', 'The browser\'s own chroma upscaling, usually bilinear: color bleeds a little over sharp edges.'],
-                ['cfl', 'CfL', 'Chroma from Luma prediction: sharper color edges, as with mpv\'s CfL_Prediction.glsl. Not in Fast or Fastest.'],
-                ['cfl-lite', 'CfL Lite', 'CfL_Prediction_Lite.glsl: fewer samples and no smoothing pass. A bit cheaper. Not in Fast or Fastest.'],
+                ['cfl', 'CfL', 'Chroma from Luma prediction: sharper color edges, as with mpv\'s CfL_Prediction.glsl.'],
+                ['cfl-lite', 'CfL Lite', 'CfL_Prediction_Lite.glsl: fewer samples and no smoothing pass. A bit cheaper.'],
             ]),
-            iterations: number('iterations', 1),
-            threshold: number('threshold', 1),
-            range: number('range', 1),
-            grain: number('grain', 1),
-            matrix: select('matrix', [['709', 'BT.709'], ['601', 'BT.601']]),
-            snap: check('snap'),
-            dither: check('dither'),
-            precision: select('precision', [['half', 'Half float (RGBA16F)'], ['byte', '8-bit (RGBA8)']]),
-            backend: select('backend', [['auto', 'Auto'], ['webgpu', 'WebGPU'], ['webgl2', 'WebGL2'], ['webgl1', 'WebGL1']]),
-            split: check('split'),
+            matrix: choice('matrix', [
+                ['709', 'BT.709', 'The matrix of HD video, and of most video on YouTube.'],
+                ['601', 'BT.601', 'For SD videos encoded as BT.601, which need it for exact colors.'],
+            ]),
+            snap: toggle('snap'),
+            dither: toggle('dither'),
+            backend: choice('backend', [
+                ['auto', 'Auto', 'WebGPU where the browser has it, otherwise WebGL2, otherwise WebGL1.'],
+                ['webgpu', 'WebGPU', 'Imports the video frame directly instead of uploading a copy of it.'],
+                ['webgl2', 'WebGL2', 'Uploads a copy of each frame. Pick it if WebGPU misbehaves.'],
+                ['webgl1', 'WebGL1', 'For browsers without WebGL2, such as Tor Browser and Mullvad Browser.'],
+            ]),
+            precision: choice('precision', [
+                ['half', 'Half float', 'RGBA16F: keeps the frame\'s precision. Used by WebGL2, and by WebGPU where it can\'t import the video.'],
+                ['byte', '8-bit', 'RGBA8: the cheapest upload, and what Fast and Fastest always use.'],
+            ]),
             hotkeyToggle: hotkey('hotkeyToggle'),
             hotkeyPanel: hotkey('hotkeyPanel'),
         };
 
-        const mpvText = el('textarea', {
-            rows: 2, placeholder: 'Paste from mpv.conf, e.g.\ndeband-iterations=2', style: Object.assign({}, inputStyle, { resize: 'vertical' }),
-        });
-        const statusEl = el('div', { style: { opacity: '0.7', fontSize: '11px', marginTop: '8px' }, textContent: status });
         const presetName = el('input', {
-            type: 'text', maxLength: 40, placeholder: 'Preset name',
-            style: Object.assign({}, inputStyle, { flex: '1', minWidth: '0' }),
+            type: 'text', maxLength: 40, placeholder: 'Name these values',
             onkeydown: (e) => {
                 if (e.key === 'Enter')
                     saveAsPreset();
@@ -2638,20 +3003,86 @@ fn upscaleChroma(p: vec2f, uv: vec2f, y: f32) -> vec2f { return cfl(p, y); }`;
         const saveButton = button('Save', saveAsPreset);
         saveButton.title = 'Save the four values above as a preset; an existing name of yours is updated';
 
-        const root = el('div', {
-            className: 'yt-deband-panel',
-            style: {
-                position: 'fixed', top: '72px', right: '16px', zIndex: '2147483647', width: '320px',
-                maxHeight: 'calc(100vh - 114px)', overflowY: 'auto', // ends 16px above the bottom
-                background: 'rgba(20,20,20,0.96)', color: '#eee', border: '1px solid #444', borderRadius: '8px',
-                padding: '12px 14px', font: '13px/1.4 system-ui, sans-serif', boxShadow: '0 4px 24px rgba(0,0,0,0.5)',
-                display: 'none',
-            },
-            // Keep YouTube's hotkeys from reacting while typing in the panel
-            onkeydown: (e) => e.stopPropagation(),
-        },
+        const mpvText = el('textarea', {
+            rows: 3, spellcheck: false, 'aria-label': 'mpv options',
+            placeholder: 'deband-iterations=2\ndeband-threshold=35\nglsl-shaders=~~/CfL_Prediction.glsl',
+        });
+
+        // Reset asks for a second click, since it can't be undone
+        let disarm = null;
+        const reset = button('Reset all settings', () => {
+            if (!disarm) {
+                reset.classList.add('armed');
+                reset.textContent = 'Click again to reset';
+                const timer = setTimeout(() => disarm(), 3000);
+                disarm = () => {
+                    clearTimeout(timer);
+                    disarm = null;
+                    reset.classList.remove('armed');
+                    reset.textContent = 'Reset all settings';
+                };
+                return;
+            }
+            disarm();
+            applySettings(Object.assign({}, DEFAULTS));
+        }, 'danger');
+        reset.title = 'Every setting back to its default; your presets and the panel\'s position stay';
+
+        const pages = {
+            deband: el('div', null,
+                group('Mode', false, inputs.algo),
+                group('Preset', false, inputs.preset),
+                group('Parameters', false,
+                    inputs.iterations, inputs.threshold, inputs.range, inputs.grain, advice,
+                    el('div', { className: 'row', style: { marginTop: '10px' } }, presetName, saveButton)),
+                group(null, false,
+                    line('Split compare', 'Left half original, right half debanded', inputs.split))),
+            picture: el('div', null,
+                group('Chroma upscaling', true, inputs.chroma),
+                group('YCbCr matrix', false, inputs.matrix),
+                group(null, false,
+                    line('Snap luma', 'Round recovered luma to the 8-bit code grid, undoing the browser\'s RGB rounding.', inputs.snap, true),
+                    line('Dither', 'Dither the output down to 8 bits, as mpv does.', inputs.dither))),
+            advanced: el('div', null,
+                group('Renderer', false, inputs.backend),
+                group('Upload format', true, inputs.precision),
+                group('Shortcuts', false,
+                    line('Toggle debanding', 'Turns debanding on and off', inputs.hotkeyToggle),
+                    line('Open this panel', 'Shows and hides these settings', inputs.hotkeyPanel),
+                    el('div', { className: 'desc', textContent: 'Click a shortcut, then press the new keys; Esc cancels.' })),
+                group('Import from mpv', false,
+                    mpvText,
+                    el('div', { className: 'row end' },
+                        el('span', { className: 'desc', style: { flex: '1', marginTop: '0' }, textContent: 'Paste your whole mpv.conf, some lines or flags.' }),
+                        button('Apply', () => setStatus(parseMpvOptions(mpvText.value)), 'primary'))),
+                group(null, false, el('div', { className: 'row' }, reset))),
+        };
+        const tabNames = [['deband', 'Deband'], ['picture', 'Picture'], ['advanced', 'Advanced']];
+        const tabs = tabNames.map(([id, text]) => el('button', {
+            type: 'button', className: 'tab', role: 'tab', textContent: text,
+            onclick: () => showTab(id),
+        }));
+        const body = el('div', { className: 'body' }, ...Object.values(pages));
+        const showTab = (id) => {
+            tabNames.forEach(([t], i) => {
+                tabs[i].setAttribute('aria-selected', t === id);
+                pages[t].hidden = t !== id;
+            });
+            body.scrollTop = 0;
+        };
+        showTab('deband');
+
+        const statusText = el('span');
+        const statusEl = el('div', { className: 'status' }, el('span', { className: 'dot' }), statusText);
+        const showStatus = (text) => {
+            statusText.textContent = text || 'Waiting for a video';
+            statusEl.className = 'status ' + (text.startsWith('Error') ? 'error' : text.startsWith('Skipped') ? 'warn'
+                : settings.enabled && debander ? 'ok' : '');
+        };
+
+        const box = el('div', { className: 'panel' },
             el('div', {
-                style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '4px', cursor: 'move', userSelect: 'none', touchAction: 'none' },
+                className: 'head',
                 title: 'Drag to move the panel; double-click to put it back',
                 onpointerdown: startPanelDrag,
                 ondblclick: (e) => {
@@ -2661,56 +3092,37 @@ fn upscaleChroma(p: vec2f, uv: vec2f, y: f32) -> vec2f { return cfl(p, y); }`;
                     placePanel();
                 },
             },
-                el('span', null,
-                    el('strong', { textContent: 'Deband' }),
-                    el('span', { textContent: ' v' + VERSION, style: { opacity: '0.6', fontSize: '11px' } })),
-                button('×', () => togglePanel(false))),
-            row('Enabled', inputs.enabled),
-            section('Mode', inputs.algo),
-            section('Preset', inputs.preset),
-            row('iterations', inputs.iterations, '--deband-iterations=<0..16> (default 1)'),
-            row('threshold', inputs.threshold, '--deband-threshold=<0..4096> (default 48)'),
-            row('range', inputs.range, '--deband-range=<1..64> (default 16)'),
-            row('grain', inputs.grain, '--deband-grain=<0..4096> (default 32)'),
-            el('div', { style: { display: 'flex', gap: '8px', margin: '6px 0 10px' } }, presetName, saveButton),
-            row('mpv options', mpvText),
-            el('div', { style: { display: 'flex', gap: '8px', margin: '6px 0 10px' } },
-                button('Apply mpv options', () => {
-                    const n = parseMpvOptions(mpvText.value);
-                    setStatus(`Applied ${n} option${n === 1 ? '' : 's'}`);
-                }),
-                button('Reset', () => {
-                    Object.assign(settings, DEFAULTS);
-                    saveSettings();
-                    refreshPanel();
-                    requestRender();
-                })),
-            section('Chroma upscaling', inputs.chroma),
-            row('Matrix', inputs.matrix, 'YCbCr matrix the browser used to convert the video to RGB'),
-            row('Snap luma', inputs.snap, 'Round recovered luma to the 8-bit code grid, undoing the browser\'s RGB rounding (not in Fast or Fastest)'),
-            row('Dither', inputs.dither, 'Dither output to 8 bits (mpv dithers by default)'),
-            row('Upload', inputs.precision, 'Format the video frame is uploaded into (WebGL2, and WebGPU where it can\'t read the video directly; Fast and Fastest always use 8-bit)'),
-            row('Renderer', inputs.backend, 'Auto uses WebGPU when available, otherwise WebGL2, otherwise WebGL1'),
-            row('Split compare', inputs.split, 'Left half original, right half debanded'),
-            row('Toggle key', inputs.hotkeyToggle, 'Click, then press the shortcut that turns debanding on and off'),
-            row('Panel key', inputs.hotkeyPanel, 'Click, then press the shortcut that opens this panel'),
-            statusEl,
-        );
+                el('span', { className: 'logo' }),
+                el('span', { className: 'title' }, 'Deband', el('span', { className: 'version', textContent: 'v' + VERSION })),
+                state, enabled,
+                iconButton('M6 6l12 12M18 6L6 18', 'Close', () => togglePanel(false))),
+            el('div', { className: 'tabs', role: 'tablist' }, ...tabs),
+            body,
+            statusEl);
+
+        const root = el('div', {
+            className: 'yt-deband-panel',
+            style: { position: 'fixed', top: '72px', right: '16px', zIndex: '2147483647', display: 'none' },
+            // Keep YouTube's hotkeys from reacting while typing in the panel
+            onkeydown: (e) => {
+                e.stopPropagation();
+                if (e.key === 'Escape')
+                    togglePanel(false);
+            },
+        });
+        root.attachShadow({ mode: 'open' }).append(el('style', { textContent: PANEL_CSS }), box);
         document.body.append(root);
-        return { root, inputs, status: statusEl };
+        return { root, box, inputs, advice, showStatus };
     }
 
     function refreshPanel() {
         if (!panel)
             return;
-        for (const [key, input] of Object.entries(panel.inputs)) {
-            if (input.refresh)
-                input.refresh(settings[key]);
-            else if (input.type === 'checkbox')
-                input.checked = !!settings[key];
-            else
-                input.value = settings[key];
-        }
+        for (const [key, input] of Object.entries(panel.inputs))
+            input.refresh(settings[key]);
+        panel.advice.refresh();
+        panel.box.classList.toggle('fast', settings.algo === 'fast' || settings.algo === 'fastest');
+        panel.showStatus(status);
     }
 
     function togglePanel(show) {
@@ -2732,7 +3144,6 @@ fn upscaleChroma(p: vec2f, uv: vec2f, y: f32) -> vec2f { return cfl(p, y); }`;
             host.append(panel.root);
         panel.root.style.display = visible ? 'block' : 'none';
         refreshPanel();
-        panel.status.textContent = status;
         if (visible)
             placePanel();
     }
