@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube Deband (mpv / libplacebo)
 // @namespace    youtube-deband
-// @version      1.10.0
+// @version      1.10.1
 // @description  Debands YouTube video in WebGL2 using a port of mpv's deband shaders (vo=gpu-next / libplacebo and legacy vo=gpu), with mpv's parameters.
 // @match        *://*.youtube.com/*
 // @match        *://www.youtube-nocookie.com/*
@@ -48,7 +48,7 @@
     const STORAGE_KEY = 'yt-deband-settings';
     const PRESETS_KEY = 'yt-deband-presets'; // the user's own presets, apart so Reset keeps them
     const PANEL_POS_KEY = 'yt-deband-panel-pos'; // where the panel was dragged to, apart so Reset keeps it
-    const VERSION = '1.10.0'; // keep in sync with @version
+    const VERSION = '1.10.1'; // keep in sync with @version
 
     // Option ranges match mpv's deband_conf (video/out/gpu/video_shaders.c)
     const DEFAULTS = {
@@ -1334,15 +1334,23 @@ vec2 upscaleChroma(vec2 p, vec2 uv, float y) { return cfl(p, y); }`;
         schedule();
     }
 
-    // Mirror the video element's box; YouTube positions it with inline styles
+    // Mirror the video element's box; YouTube positions it with inline styles.
+    // The box has the aspect ratio of the video's top resolution and the
+    // browser letterboxes each stream into it (object-fit: contain), so a
+    // canvas stretched over the box (fill, a canvas's default) is scaled a
+    // little differently: low resolutions, whose sizes are rounded further
+    // from that ratio, shift visibly toward the edges.
     function syncBox() {
         if (!video || !canvas)
             return;
+        const cs = getComputedStyle(video);
         Object.assign(canvas.style, {
             left: video.offsetLeft + 'px',
             top: video.offsetTop + 'px',
             width: video.offsetWidth + 'px',
             height: video.offsetHeight + 'px',
+            objectFit: cs.objectFit,
+            objectPosition: cs.objectPosition,
         });
     }
     document.addEventListener('fullscreenchange', syncBox);
