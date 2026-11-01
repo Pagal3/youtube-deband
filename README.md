@@ -73,6 +73,11 @@ Both hotkeys can be re-recorded under **Advanced**. Drag the panel by its
 title bar to move it (it remembers where); double-click the title bar to put
 it back.
 
+<p>
+  <img src="docs/panel-deband.png" width="372" alt="Settings panel, Deband tab: mode, preset, the four parameters and split compare">
+  <img src="docs/panel-picture.png" width="372" alt="Settings panel, Picture tab: chroma upscaling, YCbCr matrix, luma snapping and dither">
+</p>
+
 | Setting          | Default    | mpv option                           |
 |------------------|------------|--------------------------------------|
 | Mode             | `gpu-next` | `--vo`                               |
