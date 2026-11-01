@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube Deband (mpv / libplacebo)
 // @namespace    youtube-deband
-// @version      1.14.0
+// @version      1.14.1
 // @description  Debands YouTube video in WebGPU or WebGL using a port of mpv's deband shaders (vo=gpu-next / libplacebo and legacy vo=gpu), with mpv's parameters.
 // @match        *://*.youtube.com/*
 // @match        *://www.youtube-nocookie.com/*
@@ -58,7 +58,7 @@
     const PRESETS_KEY = 'yt-deband-presets'; // the user's own presets, apart so Reset keeps them
     const PANEL_POS_KEY = 'yt-deband-panel-pos'; // where the panel was dragged to, apart so Reset keeps it
     const SWITCH_KEY = 'yt-deband-codec-switch'; // in sessionStorage: { video, codec } switched to for one video
-    const VERSION = '1.14.0'; // keep in sync with @version
+    const VERSION = '1.14.1'; // keep in sync with @version
 
     // Option ranges match mpv's deband_conf (video/out/gpu/video_shaders.c)
     const DEFAULTS = {
@@ -2534,25 +2534,44 @@ fn upscaleChroma(p: vec2f, uv: vec2f, y: f32) -> vec2f { return cfl(p, y); }`;
         };
 
         // The page's first video. Its inline script assigns this global,
-        // which runs the setter.
-        let initial;
-        Object.defineProperty(window, 'ytInitialPlayerResponse', {
-            configurable: true,
-            get: () => initial,
-            set: (v) => {
-                steer(v);
-                initial = v;
-            },
-        });
-        // Later videos, and the same one again
+        // which runs the setter. A content blocker may have trapped it
+        // already (uBlock Origin prunes the ads from it that way), so an
+        // earlier accessor is kept in the chain, not replaced.
+        const prior = Object.getOwnPropertyDescriptor(window, 'ytInitialPlayerResponse');
+        if (!prior || prior.configurable) {
+            let initial = prior && !prior.get && !prior.set ? prior.value : undefined;
+            Object.defineProperty(window, 'ytInitialPlayerResponse', {
+                configurable: true,
+                enumerable: true,
+                get: () => (prior && prior.get ? prior.get.call(window) : initial),
+                set: (v) => {
+                    steer(v);
+                    if (prior && prior.set)
+                        prior.set.call(window, v);
+                    else
+                        initial = v;
+                },
+            });
+        }
+        // Later videos, and the same one again. A blocker's own fetch wrapper
+        // may sit inside or outside this one; the response handed on looks
+        // like the one fetched (url and all), so either way it still matches.
         const fetch = window.fetch;
         window.fetch = function (input) {
             const pending = fetch.apply(this, arguments);
             if (!/\/youtubei\/v1\/player\b/.test(input instanceof Request ? input.url : input))
                 return pending;
-            return pending.then((res) => res.clone().json().then((response) => (steer(response)
-                ? new Response(JSON.stringify(response), { status: res.status, statusText: res.statusText, headers: res.headers })
-                : res), () => res));
+            return pending.then((res) => res.clone().json().then((response) => {
+                if (!steer(response))
+                    return res;
+                const steered = new Response(JSON.stringify(response), { status: res.status, statusText: res.statusText, headers: res.headers });
+                Object.defineProperties(steered, {
+                    url: { value: res.url },
+                    type: { value: res.type },
+                    redirected: { value: res.redirected },
+                });
+                return steered;
+            }, () => res));
         };
 
         // What a MediaSource's video plays, on the <video> it is attached to
