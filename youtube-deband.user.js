@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube Deband (mpv / libplacebo)
 // @namespace    youtube-deband
-// @version      1.13.0
+// @version      1.13.1
 // @description  Debands YouTube video in WebGPU or WebGL using a port of mpv's deband shaders (vo=gpu-next / libplacebo and legacy vo=gpu), with mpv's parameters.
 // @match        *://*.youtube.com/*
 // @match        *://www.youtube-nocookie.com/*
@@ -53,7 +53,7 @@
     const STORAGE_KEY = 'yt-deband-settings';
     const PRESETS_KEY = 'yt-deband-presets'; // the user's own presets, apart so Reset keeps them
     const PANEL_POS_KEY = 'yt-deband-panel-pos'; // where the panel was dragged to, apart so Reset keeps it
-    const VERSION = '1.13.0'; // keep in sync with @version
+    const VERSION = '1.13.1'; // keep in sync with @version
 
     // Option ranges match mpv's deband_conf (video/out/gpu/video_shaders.c)
     const DEFAULTS = {
@@ -74,6 +74,7 @@
         hotkeyToggle: 'Ctrl+Alt+d',
         hotkeyPanel: 'Ctrl+Alt+b',
         split: false,       // left half original, right half debanded
+        revision: 1,        // of the saved settings, for one-time migrations in loadSettings
     };
     const LIMITS = {
         iterations: [0, 16],
@@ -107,7 +108,11 @@
     function loadSettings() {
         try {
             const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}');
-            return Object.assign({}, DEFAULTS, saved);
+            // Before revision 1 Half float was the default upload format, so
+            // nearly every saved copy holds it; it gains nothing, so move off it
+            if (!(saved.revision >= 1))
+                saved.precision = 'byte';
+            return Object.assign({}, DEFAULTS, saved, { revision: DEFAULTS.revision });
         } catch (e) {
             return Object.assign({}, DEFAULTS);
         }
