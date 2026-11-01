@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube Deband (mpv / libplacebo)
 // @namespace    youtube-deband
-// @version      1.11.0
+// @version      1.12.0
 // @description  Debands YouTube video in WebGPU or WebGL using a port of mpv's deband shaders (vo=gpu-next / libplacebo and legacy vo=gpu), with mpv's parameters.
 // @match        *://*.youtube.com/*
 // @match        *://www.youtube-nocookie.com/*
@@ -37,6 +37,7 @@
  *             mpv's option mapping from video/out/vo_gpu_next.c
  *   gpu:      mpv video/out/gpu/video_shaders.c pass_sample_deband()
  *   fast:     gpu-next cut down to one pass over the RGB frame, for weak GPUs
+ *   fastest:  fast worked out at half resolution, for integrated GPUs
  *   CfL:      CfL_Prediction.glsl and CfL_Prediction_Lite.glsl from
  *             github.com/Artoriuz/glsl-chroma-from-luma-prediction (MIT,
  *             notice with the port)
@@ -52,12 +53,12 @@
     const STORAGE_KEY = 'yt-deband-settings';
     const PRESETS_KEY = 'yt-deband-presets'; // the user's own presets, apart so Reset keeps them
     const PANEL_POS_KEY = 'yt-deband-panel-pos'; // where the panel was dragged to, apart so Reset keeps it
-    const VERSION = '1.11.0'; // keep in sync with @version
+    const VERSION = '1.12.0'; // keep in sync with @version
 
     // Option ranges match mpv's deband_conf (video/out/gpu/video_shaders.c)
     const DEFAULTS = {
         enabled: true,
-        algo: 'gpu-next',   // 'gpu-next' (libplacebo) | 'gpu' (legacy mpv shader) | 'fast' (single pass)
+        algo: 'gpu-next',   // 'gpu-next' (libplacebo) | 'gpu' (legacy mpv shader) | 'fast' (single pass) | 'fastest' (half resolution)
         iterations: 1,      // --deband-iterations=<0..16>
         threshold: 48,      // --deband-threshold=<0..4096>
         range: 16,          // --deband-range=<1..64>
@@ -476,6 +477,17 @@ void main() {
     FRAG = storePlane(deband(floor(gl_FragCoord.xy)) + DELTA_BIAS);
 }`;
 
+    // The canvas pixel: dithered to 8 bits if asked, clamped, opaque
+    const FINISH = `
+uniform bool u_dither;
+vec4 finish(vec3 rgb) {
+    if (u_dither) {
+        float n = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
+        rgb = floor(rgb * 255.0 + n) / 255.0;
+    }
+    return vec4(clamp(rgb, 0.0, 1.0), 1.0);
+}`;
+
     // Deband luma at this pixel (the luma pass is folded in here, saving a
     // full resolution render target), add the chroma change, convert the
     // change to RGB, dither, flip onto the canvas. Only the change is added on
@@ -484,10 +496,9 @@ void main() {
     // lumaDelta is the expression for the luma change at plane pixel p.
     // upscale is code for chroma upscaling that replaces the browser's (see
     // UPSCALE_CFL), or empty.
-    const fsFinal = (deband, lumaDelta, upscale) => YCC + deband + `
+    const fsFinal = (deband, lumaDelta, upscale) => YCC + deband + FINISH + `
 uniform sampler2D u_c, u_src;
 uniform vec2 u_size, u_csize;
-uniform bool u_dither;
 uniform float u_split;
 ${upscale}
 void main() {
@@ -504,11 +515,7 @@ void main() {
 #endif
         rgb += dycc2rgb(vec3(${lumaDelta}, dc));
     }
-    if (u_dither) {
-        float n = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
-        rgb = floor(rgb * 255.0 + n) / 255.0;
-    }
-    FRAG = vec4(clamp(rgb, 0.0, 1.0), 1.0);
+    FRAG = finish(rgb);
 }`;
 
     // Fast mode for weak GPUs: one pass straight from the RGB frame, with no
@@ -518,14 +525,12 @@ void main() {
     // debanded at full resolution with the same samples as luma, luma isn't
     // snapped, and the random numbers come from a cheap float hash instead of
     // pcg3d. YCbCr is linear in RGB, so averaging RGB averages YCbCr.
-    const FS_FAST = YCC + `
+    const FAST = `
 uniform sampler2D u_src;
 uniform vec2 u_texSize;
 uniform float u_frame;
 uniform int u_iter;
 uniform float u_radius, u_threshold, u_grain;
-uniform bool u_dither;
-uniform float u_split;
 
 // A few multiply-adds and fracts: no integers (slow or missing on old GPUs
 // and WebGL1) and no trig. Inputs up to a few thousand, outputs ~9 bits.
@@ -535,37 +540,90 @@ vec3 rand3(vec3 p) {
     return fract((p + p.yzx) * p.zxy * 3.71);
 }
 
+float fastSeed() { return mod(u_frame, 256.0) * 17.0; }
+
+// The frame debanded at texture coordinate pos, whose YCbCr is orig, with
+// the random numbers of pixel p
+vec3 fastDeband(vec2 p, vec2 pos, vec3 orig) {
+    vec2 pt = 1.0 / u_texSize;
+    vec3 res = orig;
+    for (int i = 1; i <= 16; i++) {
+        if (i > u_iter)
+            break;
+        vec2 d = rand3(vec3(p, fastSeed() + float(i))).xy * vec2(float(i) * u_radius, 6.283185);
+        d = d.x * vec2(cos(d.y), sin(d.y)) * pt;
+        vec3 avg = rgb2ycc(0.25 * (TEX(u_src, pos + d).rgb +
+                                   TEX(u_src, pos + vec2(-d.x, d.y)).rgb +
+                                   TEX(u_src, pos - d).rgb +
+                                   TEX(u_src, pos + vec2(d.x, -d.y)).rgb));
+        res = mix(avg, res, vec3(greaterThan(abs(res - avg), vec3(u_threshold / float(i)))));
+    }
+    return res;
+}
+
+// The grain to add at pixel p to the debanded YCbCr res
+vec3 fastGrain(vec2 p, vec3 res) {
+    vec3 strength = min(abs(res - vec3(16.0, 128.0, 128.0) / 255.0), vec3(u_grain));
+    return strength * (rand3(vec3(p, fastSeed())) - 0.5);
+}
+`;
+    const FS_FAST = YCC + FAST + FINISH + `
+uniform float u_split;
 void main() {
     vec2 p = vec2(floor(gl_FragCoord.x), u_texSize.y - 1.0 - floor(gl_FragCoord.y));
-    vec2 pt = 1.0 / u_texSize;
-    vec2 pos = (p + 0.5) * pt;
+    vec2 pos = (p + 0.5) / u_texSize;
     vec3 rgb = TEX(u_src, pos).rgb;
     if (p.x >= u_split * u_texSize.x) {
-        float seed = mod(u_frame, 256.0) * 17.0;
         vec3 orig = rgb2ycc(rgb);
-        vec3 res = orig;
-        for (int i = 1; i <= 16; i++) {
-            if (i > u_iter)
-                break;
-            vec2 d = rand3(vec3(p, seed + float(i))).xy * vec2(float(i) * u_radius, 6.283185);
-            d = d.x * vec2(cos(d.y), sin(d.y)) * pt;
-            vec3 avg = rgb2ycc(0.25 * (TEX(u_src, pos + d).rgb +
-                                       TEX(u_src, pos + vec2(-d.x, d.y)).rgb +
-                                       TEX(u_src, pos - d).rgb +
-                                       TEX(u_src, pos + vec2(d.x, -d.y)).rgb));
-            res = mix(avg, res, vec3(greaterThan(abs(res - avg), vec3(u_threshold / float(i)))));
-        }
-        if (u_grain > 0.0) {
-            vec3 strength = min(abs(res - vec3(16.0, 128.0, 128.0) / 255.0), vec3(u_grain));
-            res += strength * (rand3(vec3(p, seed)) - 0.5);
-        }
+        vec3 res = fastDeband(p, pos, orig);
+        if (u_grain > 0.0)
+            res += fastGrain(p, res);
         rgb += dycc2rgb(res - orig);
     }
-    if (u_dither) {
-        float n = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
-        rgb = floor(rgb * 255.0 + n) / 255.0;
+    FRAG = finish(rgb);
+}`;
+
+    // Fastest mode: Fast debanding the middle of each 2x2 block of the frame,
+    // a quarter of the pixels, and its change upscaled onto the frame. Most
+    // of Fast's cost is the scattered fetches, which miss the small caches of
+    // integrated GPUs. The change is at most the threshold per iteration, and
+    // none at edges, which differ by more, so upscaling it loses little: the
+    // debanding noise comes out softer and pixel-wide streaks stay. Grain and
+    // dither stay per pixel.
+    //
+    // The half resolution pass starts from the block's average and stores
+    // the change in RGB, scaled and offset into an 8-bit texture (see
+    // fastestDeltaScale()). It samples the frame nearest like Fast: bilinear
+    // samples at the scattered positions would each touch up to four times
+    // the cache lines.
+    const FS_FASTEST_DELTA = YCC + FAST + `
+uniform float u_deltaScale;
+void main() {
+    vec2 q = floor(gl_FragCoord.xy);
+    vec2 pt = 1.0 / u_texSize;
+    vec2 pos = (2.0 * q + 1.0) * pt;
+    vec3 orig = rgb2ycc(0.25 * (TEX(u_src, pos - 0.5 * pt).rgb +
+                                TEX(u_src, pos + vec2(0.5, -0.5) * pt).rgb +
+                                TEX(u_src, pos + vec2(-0.5, 0.5) * pt).rgb +
+                                TEX(u_src, pos + 0.5 * pt).rgb));
+    FRAG = vec4(dycc2rgb(fastDeband(q, pos, orig) - orig) * u_deltaScale + 128.0 / 255.0, 1.0);
+}`;
+    // The frame plus the upscaled change, then grain on the result (YCbCr is
+    // affine in RGB, so converting it gives the debanded YCbCr)
+    const FS_FASTEST_FINAL = YCC + FAST + FINISH + `
+uniform sampler2D u_delta;
+uniform vec2 u_csize;
+uniform float u_deltaScale;
+uniform float u_split;
+void main() {
+    vec2 p = vec2(floor(gl_FragCoord.x), u_texSize.y - 1.0 - floor(gl_FragCoord.y));
+    vec3 rgb = TEX(u_src, (p + 0.5) / u_texSize).rgb;
+    if (p.x >= u_split * u_texSize.x) {
+        rgb += (TEX(u_delta, (p + 0.5) / (2.0 * u_csize)).rgb - 128.0 / 255.0) / u_deltaScale;
+        if (u_grain > 0.0)
+            rgb += dycc2rgb(fastGrain(p, rgb2ycc(rgb)));
     }
-    FRAG = vec4(clamp(rgb, 0.0, 1.0), 1.0);
+    FRAG = finish(rgb);
 }`;
 
     // ------------------------------------------------------------------
@@ -778,6 +836,8 @@ vec2 upscaleChroma(vec2 p, vec2 uv, float y) { return cfl(p, y); }`;
         legacyFinalCfl: fsFinal(DEBAND_LEGACY, 'deband(p).x', UPSCALE_CFL),
         legacyFinalCflLite: fsFinal(DEBAND_LEGACY, 'deband(p).x', UPSCALE_CFL_LITE),
         fast: FS_FAST,
+        fastestDelta: FS_FASTEST_DELTA,
+        fastestFinal: FS_FASTEST_FINAL,
     };
     // Final pass program suffix per chroma upscaling
     const FINAL_CHROMA = { browser: '', cfl: 'Cfl', 'cfl-lite': 'CflLite' };
@@ -800,10 +860,11 @@ vec2 upscaleChroma(vec2 p, vec2 uv, float y) { return cfl(p, y); }`;
     const WGSL_PARAMS = [
         ['k', 2], ['srcSize', 2], ['texSize', 2], ['size', 2], ['csize', 2], ['neutral', 2],
         ['frame', 1], ['iter', 1, 'i32'], ['radius', 1], ['threshold', 1], ['grain', 1],
-        ['random', 1], ['range', 1], ['gain', 1], ['split', 1],
+        ['random', 1], ['range', 1], ['gain', 1], ['split', 1], ['deltaScale', 1],
         ['snap', 1, 'u32'], ['luma', 1, 'u32'], ['dither', 1, 'u32'],
     ];
-    const PARAMS_SIZE = WGSL_PARAMS.reduce((n, [, c]) => n + 4 * c, 0);
+    // Rounded up to the struct's alignment, that of a vec2
+    const PARAMS_SIZE = Math.ceil(WGSL_PARAMS.reduce((n, [, c]) => n + 4 * c, 0) / 8) * 8;
     const PARAMS_STRIDE = 256; // the largest minUniformBufferOffsetAlignment
 
     const WGSL_COMMON = `
@@ -1023,37 +1084,74 @@ fn deband(px: vec2f) -> vec2f {
     return finish(fc.xy, rgb);
 }`;
 
-    // As FS_FAST
-    const WGSL_FAST = `
+    // As FAST
+    const WGSL_FAST_COMMON = `
 fn rand3(q: vec3f) -> vec3f {
     var p = fract(q * vec3f(0.1347, 0.1593, 0.1771) + q.yzx * vec3f(0.0719, 0.0547, 0.0613));
     p += dot(p, p.zxy + 19.19);
     return fract((p + p.yzx) * p.zxy * 3.71);
 }
 
+fn fastSeed() -> f32 { return (P.frame % 256.0) * 17.0; }
+
+fn fastDeband(p: vec2f, pos: vec2f, orig: vec3f) -> vec3f {
+    let pt = 1.0 / P.texSize;
+    var res = orig;
+    for (var i = 1; i <= P.iter; i++) {
+        var d = rand3(vec3f(p, fastSeed() + f32(i))).xy * vec2f(f32(i) * P.radius, 6.283185);
+        d = d.x * vec2f(cos(d.y), sin(d.y)) * pt;
+        let avg = rgb2ycc(0.25 * (srcPixel(pos + d) +
+                                  srcPixel(pos + vec2f(-d.x, d.y)) +
+                                  srcPixel(pos - d) +
+                                  srcPixel(pos + vec2f(d.x, -d.y))));
+        res = select(avg, res, abs(res - avg) > vec3f(P.threshold / f32(i)));
+    }
+    return res;
+}
+
+fn fastGrain(p: vec2f, res: vec3f) -> vec3f {
+    let strength = min(abs(res - vec3f(16.0, 128.0, 128.0) / 255.0), vec3f(P.grain));
+    return strength * (rand3(vec3f(p, fastSeed())) - 0.5);
+}
+`;
+
+    // As FS_FAST
+    const WGSL_FAST = WGSL_FAST_COMMON + `
 @fragment fn fs(@builtin(position) fc: vec4f) -> @location(0) vec4f {
     let p = floor(fc.xy);
-    let pt = 1.0 / P.texSize;
-    let pos = (p + 0.5) * pt;
+    let pos = (p + 0.5) / P.texSize;
     var rgb = srcPixel(pos);
     if (p.x >= P.split * P.texSize.x) {
-        let seed = (P.frame % 256.0) * 17.0;
         let orig = rgb2ycc(rgb);
-        var res = orig;
-        for (var i = 1; i <= P.iter; i++) {
-            var d = rand3(vec3f(p, seed + f32(i))).xy * vec2f(f32(i) * P.radius, 6.283185);
-            d = d.x * vec2f(cos(d.y), sin(d.y)) * pt;
-            let avg = rgb2ycc(0.25 * (srcPixel(pos + d) +
-                                      srcPixel(pos + vec2f(-d.x, d.y)) +
-                                      srcPixel(pos - d) +
-                                      srcPixel(pos + vec2f(d.x, -d.y))));
-            res = select(avg, res, abs(res - avg) > vec3f(P.threshold / f32(i)));
-        }
+        var res = fastDeband(p, pos, orig);
         if (P.grain > 0.0) {
-            let strength = min(abs(res - vec3f(16.0, 128.0, 128.0) / 255.0), vec3f(P.grain));
-            res += strength * (rand3(vec3f(p, seed)) - 0.5);
+            res += fastGrain(p, res);
         }
         rgb += dycc2rgb(res - orig);
+    }
+    return finish(fc.xy, rgb);
+}`;
+
+    // As FS_FASTEST_DELTA and FS_FASTEST_FINAL; one bilinear fetch takes the
+    // block's average
+    const WGSL_FASTEST_DELTA = WGSL_FAST_COMMON + `
+@fragment fn fs(@builtin(position) fc: vec4f) -> @location(0) vec4f {
+    let q = floor(fc.xy);
+    let pos = (2.0 * q + 1.0) / P.texSize;
+    let orig = rgb2ycc(srcLinear(pos));
+    return vec4f(dycc2rgb(fastDeband(q, pos, orig) - orig) * P.deltaScale + 128.0 / 255.0, 1.0);
+}`;
+    const WGSL_FASTEST_FINAL = WGSL_FAST_COMMON + `
+@group(0) @binding(4) var u_delta: texture_2d<f32>;
+@fragment fn fs(@builtin(position) fc: vec4f) -> @location(0) vec4f {
+    let p = floor(fc.xy);
+    var rgb = srcPixel((p + 0.5) / P.texSize);
+    if (p.x >= P.split * P.texSize.x) {
+        let delta = textureSampleLevel(u_delta, s_lin, (p + 0.5) / (2.0 * P.csize), 0.0).rgb;
+        rgb += (delta - 128.0 / 255.0) / P.deltaScale;
+        if (P.grain > 0.0) {
+            rgb += dycc2rgb(fastGrain(p, rgb2ycc(rgb)));
+        }
     }
     return finish(fc.xy, rgb);
 }`;
@@ -1214,7 +1312,22 @@ fn upscaleChroma(p: vec2f, uv: vec2f, y: f32) -> vec2f { return cfl(p, y); }`;
         legacyFinalCfl: wgslFinal(WGSL_DEBAND_LEGACY, WGSL_UPSCALE_CFL),
         legacyFinalCflLite: wgslFinal(WGSL_DEBAND_LEGACY, WGSL_UPSCALE_CFL_LITE),
         fast: WGSL_FAST,
+        fastestDelta: WGSL_FASTEST_DELTA,
+        fastestFinal: WGSL_FASTEST_FINAL,
     };
+
+    // Fastest stores the change its half resolution pass makes in an 8-bit
+    // texture, as change * scale + 128/255. Iteration i changes each YCbCr
+    // component by at most threshold / i, which changes RGB by at most 3.3
+    // times as much (blue, through Cb), so the scale fits that into the 127
+    // levels either side. Defaults leave steps of 1/50 of a code value, and
+    // no change is stored exactly.
+    function fastestDeltaScale(s) {
+        let bound = 0;
+        for (let i = 1; i <= s.iterations; i++)
+            bound += s.threshold / 16.384 / 1000 / i;
+        return (127 / 255) / Math.max(3.3 * bound, 1e-4);
+    }
 
     // ------------------------------------------------------------------
     // WebGL renderer
@@ -1229,6 +1342,7 @@ fn upscaleChroma(p: vec2f, uv: vec2f, y: f32) -> vec2f { return cfl(p, y); }`;
             this.h = 0;
             this.uploadFormat = null;
             this.fast = false;
+            this.fastest = false;
             this.chroma = 'browser';
             this.textures = [];
             this.fbos = [];
@@ -1295,7 +1409,7 @@ fn upscaleChroma(p: vec2f, uv: vec2f, y: f32) -> vec2f { return cfl(p, y); }`;
 
         get description() {
             return `${this.webgl2 ? 'WebGL2' : 'WebGL1'}, ` +
-                   `${this.fast ? 'single pass' : (this.packed ? 'packed 16-bit' : 'float') + ' planes'}, ` +
+                   `${this.fastest ? 'half resolution pass' : this.fast ? 'single pass' : (this.packed ? 'packed 16-bit' : 'float') + ' planes'}, ` +
                    `${this.uploadFormat === 'half' ? 'RGBA16F' : 'RGBA8'} upload` + CHROMA_DESCRIPTION[this.chroma];
         }
 
@@ -1363,9 +1477,11 @@ fn upscaleChroma(p: vec2f, uv: vec2f, y: f32) -> vec2f { return cfl(p, y); }`;
             return tex;
         }
 
+        // A null floatFormat makes an RGBA8 target
         target(w, h, floatFormat) {
             const gl = this.gl;
-            const tex = this.texture(w, h, this.packed ? gl.RGBA8 : floatFormat, !this.packed);
+            const byte = this.packed || !floatFormat;
+            const tex = this.texture(w, h, byte ? gl.RGBA8 : floatFormat, !byte);
             const fbo = gl.createFramebuffer();
             gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
             gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
@@ -1377,19 +1493,20 @@ fn upscaleChroma(p: vec2f, uv: vec2f, y: f32) -> vec2f { return cfl(p, y); }`;
 
         resize(w, h, s) {
             const gl = this.gl;
-            const fast = s.algo === 'fast';
-            // Fast mode takes the cheapest upload
+            const fastest = s.algo === 'fastest';
+            const fast = s.algo === 'fast' || fastest;
+            // The Fast modes take the cheapest upload
             const precision = this.webgl2 && !fast ? s.precision : 'byte';
             // Snapped luma is exactly on the 8-bit grid, so an 8-bit plane
             // holds it losslessly with half the memory traffic. Not for the
             // legacy shader: it filters luma bilinearly, and 8-bit textures
             // aren't guaranteed to filter with more than 8 bits of precision.
-            // Fast mode has no planes.
+            // The Fast modes have no planes.
             const yFormat = fast ? null : s.snap && s.algo !== 'gpu' ? gl.R8 : gl.R16F;
-            // CfL works on the planes, which Fast mode doesn't make
+            // CfL works on the planes, which the Fast modes don't make
             const chroma = !fast && (s.chroma === 'cfl' || s.chroma === 'cfl-lite') ? s.chroma : 'browser';
             if (w === this.w && h === this.h && precision === this.uploadFormat && yFormat === this.yFormat &&
-                chroma === this.chroma)
+                chroma === this.chroma && fastest === this.fastest)
                 return;
             for (const t of this.textures) gl.deleteTexture(t);
             for (const f of this.fbos) gl.deleteFramebuffer(f);
@@ -1410,6 +1527,9 @@ fn upscaleChroma(p: vec2f, uv: vec2f, y: f32) -> vec2f { return cfl(p, y); }`;
                 this.yLow = this.target(cw, ch, gl.R16F);
             if (chroma === 'cfl')
                 this.cPred = this.target(w, h, gl.RG16F);
+            // Fastest's change at half resolution
+            if (fastest)
+                this.fastDelta = this.target(cw, ch, null);
 
             this.canvas.width = w;
             this.canvas.height = h;
@@ -1418,6 +1538,7 @@ fn upscaleChroma(p: vec2f, uv: vec2f, y: f32) -> vec2f { return cfl(p, y); }`;
             this.uploadFormat = precision;
             this.yFormat = yFormat;
             this.fast = fast;
+            this.fastest = fastest;
             this.chroma = chroma;
             this.checkUpload = true;
         }
@@ -1519,10 +1640,23 @@ fn upscaleChroma(p: vec2f, uv: vec2f, y: f32) -> vec2f { return cfl(p, y); }`;
             };
 
             if (this.fast) {
-                this.pass(this.prog('fast'), null, [['u_src', this.src, false]], (loc) => {
+                const setFast = (loc) => {
                     setDeband(loc, this, 0); // the frame is the plane; neutral is set in the shader
                     setOutput(loc);
-                });
+                    if (this.fastest) {
+                        gl.uniform1f(loc.u_deltaScale, fastestDeltaScale(s));
+                        gl.uniform2f(loc.u_csize, this.fastDelta.w, this.fastDelta.h);
+                    }
+                };
+                if (this.fastest) {
+                    this.pass(this.prog('fastestDelta'), this.fastDelta, [['u_src', this.src, false]], setFast);
+                    this.pass(this.prog('fastestFinal'), null, [
+                        ['u_src', this.src, false],
+                        ['u_delta', this.fastDelta.tex, true],
+                    ], setFast);
+                } else {
+                    this.pass(this.prog('fast'), null, [['u_src', this.src, false]], setFast);
+                }
                 return;
             }
 
@@ -1602,6 +1736,7 @@ fn upscaleChroma(p: vec2f, uv: vec2f, y: f32) -> vec2f { return cfl(p, y); }`;
             this.h = 0;
             this.copyFormat = null;
             this.fast = false;
+            this.fastest = false;
             this.chroma = 'browser';
             this.textures = [];
             this.pipelines = {};
@@ -1627,7 +1762,7 @@ fn upscaleChroma(p: vec2f, uv: vec2f, y: f32) -> vec2f { return cfl(p, y); }`;
         }
 
         get description() {
-            return `WebGPU, ${this.fast ? 'single pass' : 'float planes'}, ` +
+            return `WebGPU, ${this.fastest ? 'half resolution pass' : this.fast ? 'single pass' : 'float planes'}, ` +
                    (this.external ? 'imported video' : `${this.copyFormat === 'rgba16float' ? 'RGBA16F' : 'RGBA8'} copy`) +
                    CHROMA_DESCRIPTION[this.chroma];
         }
@@ -1679,13 +1814,14 @@ fn upscaleChroma(p: vec2f, uv: vec2f, y: f32) -> vec2f { return cfl(p, y); }`;
 
         // Formats as in WebGLDebander.resize()
         resize(w, h, s) {
-            const fast = s.algo === 'fast';
+            const fastest = s.algo === 'fastest';
+            const fast = s.algo === 'fast' || fastest;
             // A copied frame is uploaded as in WebGL2
             const copyFormat = this.external ? null : s.precision === 'half' && !fast ? 'rgba16float' : 'rgba8unorm';
             const yFormat = fast ? null : s.snap && s.algo !== 'gpu' ? 'r8unorm' : 'r16float';
             const chroma = !fast && (s.chroma === 'cfl' || s.chroma === 'cfl-lite') ? s.chroma : 'browser';
             if (w === this.w && h === this.h && copyFormat === this.copyFormat && yFormat === this.yFormat &&
-                chroma === this.chroma)
+                chroma === this.chroma && fastest === this.fastest)
                 return;
             for (const t of this.textures)
                 t.destroy();
@@ -1702,6 +1838,8 @@ fn upscaleChroma(p: vec2f, uv: vec2f, y: f32) -> vec2f { return cfl(p, y); }`;
                 this.yLow = this.texture(cw, ch, 'r16float');
             if (chroma === 'cfl')
                 this.cPred = this.texture(w, h, 'rg16float');
+            if (fastest)
+                this.fastDelta = this.texture(cw, ch, 'rgba8unorm');
 
             this.canvas.width = w;
             this.canvas.height = h;
@@ -1710,6 +1848,7 @@ fn upscaleChroma(p: vec2f, uv: vec2f, y: f32) -> vec2f { return cfl(p, y); }`;
             this.copyFormat = copyFormat;
             this.yFormat = yFormat;
             this.fast = fast;
+            this.fastest = fastest;
             this.chroma = chroma;
         }
 
@@ -1787,7 +1926,12 @@ fn upscaleChroma(p: vec2f, uv: vec2f, y: f32) -> vec2f { return cfl(p, y); }`;
                     grain: s.grain / 8.192 / 1000, neutral: [neutral, neutral] });
             const output = { k, dither: s.dither ? 1 : 0, split: s.split ? 0.5 : -1.0 };
 
-            if (this.fast) {
+            if (this.fastest) {
+                const params = Object.assign(deband(this, 0), output,
+                                             { csize: [this.fastDelta.w, this.fastDelta.h], deltaScale: fastestDeltaScale(s) });
+                pass('fastestDelta', this.fastDelta, {}, params);
+                pass('fastestFinal', null, { u_delta: this.fastDelta.view }, params);
+            } else if (this.fast) {
                 pass('fast', null, {}, Object.assign(deband(this, 0), output));
             } else {
                 const srcParams = { k, srcSize: [this.w, this.h] };
@@ -2447,12 +2591,13 @@ fn upscaleChroma(p: vec2f, uv: vec2f, y: f32) -> vec2f { return cfl(p, y); }`;
                 ['gpu-next', 'gpu-next', 'mpv\'s default: vo=gpu-next debanding (libplacebo).'],
                 ['gpu', 'gpu', 'mpv\'s older vo=gpu debanding shader.'],
                 ['fast', 'Fast', 'For weak GPUs: gpu-next in a single pass, a fraction of the GPU work, nearly the same result.'],
+                ['fastest', 'Fastest', 'For integrated graphics: Fast worked out at half resolution, a quarter to a third of its debanding work. Leaves the finest streaks.'],
             ]),
             preset: presetPicker(),
             chroma: choice('chroma', [
                 ['browser', 'Browser', 'The browser\'s own chroma upscaling, usually bilinear: color bleeds a little over sharp edges.'],
-                ['cfl', 'CfL', 'Chroma from Luma prediction: sharper color edges, as with mpv\'s CfL_Prediction.glsl. Not in Fast mode.'],
-                ['cfl-lite', 'CfL Lite', 'CfL_Prediction_Lite.glsl: fewer samples and no smoothing pass. A bit cheaper. Not in Fast mode.'],
+                ['cfl', 'CfL', 'Chroma from Luma prediction: sharper color edges, as with mpv\'s CfL_Prediction.glsl. Not in Fast or Fastest.'],
+                ['cfl-lite', 'CfL Lite', 'CfL_Prediction_Lite.glsl: fewer samples and no smoothing pass. A bit cheaper. Not in Fast or Fastest.'],
             ]),
             iterations: number('iterations', 1),
             threshold: number('threshold', 1),
@@ -2542,9 +2687,9 @@ fn upscaleChroma(p: vec2f, uv: vec2f, y: f32) -> vec2f { return cfl(p, y); }`;
                 })),
             section('Chroma upscaling', inputs.chroma),
             row('Matrix', inputs.matrix, 'YCbCr matrix the browser used to convert the video to RGB'),
-            row('Snap luma', inputs.snap, 'Round recovered luma to the 8-bit code grid, undoing the browser\'s RGB rounding (not in Fast)'),
+            row('Snap luma', inputs.snap, 'Round recovered luma to the 8-bit code grid, undoing the browser\'s RGB rounding (not in Fast or Fastest)'),
             row('Dither', inputs.dither, 'Dither output to 8 bits (mpv dithers by default)'),
-            row('Upload', inputs.precision, 'Format the video frame is uploaded into (WebGL2, and WebGPU where it can\'t read the video directly; Fast always uses 8-bit)'),
+            row('Upload', inputs.precision, 'Format the video frame is uploaded into (WebGL2, and WebGPU where it can\'t read the video directly; Fast and Fastest always use 8-bit)'),
             row('Renderer', inputs.backend, 'Auto uses WebGPU when available, otherwise WebGL2, otherwise WebGL1'),
             row('Split compare', inputs.split, 'Left half original, right half debanded'),
             row('Toggle key', inputs.hotkeyToggle, 'Click, then press the shortcut that turns debanding on and off'),

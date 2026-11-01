@@ -10,8 +10,9 @@ A userscript that debands YouTube video in the browser using WebGPU and WebGL po
   [`video/out/vo_gpu_next.c`](https://github.com/mpv-player/mpv/blob/master/video/out/vo_gpu_next.c)
 - **gpu**: mpv's legacy `pass_sample_deband()`
   ([`video/out/gpu/video_shaders.c`](https://github.com/mpv-player/mpv/blob/master/video/out/gpu/video_shaders.c))
-- **Fast**: gpu-next cut down to a single pass for weak GPUs (see
-  [Weak hardware](#weak-hardware))
+- **Fast**: gpu-next cut down to a single pass for weak GPUs, and
+  **Fastest**: Fast worked out at half resolution for integrated graphics
+  (see [Weak hardware](#weak-hardware))
 
 Like mpv, it debands the Y and subsampled CbCr planes separately before color
 conversion: the script undoes the browser's YCbCr→RGB conversion, rebuilds the
@@ -114,9 +115,9 @@ fits over the chroma pixels around it, and fall back to a plain interpolation
 where luma and chroma don't correlate. CfL Lite takes fewer samples and skips
 the final smoothing pass.
 
-- They work with gpu-next and gpu, not Fast. On a GeForce RTX 3060 at 1080p,
-  where gpu-next debanding takes about 0.16 ms of GPU time per frame, CfL
-  adds about 0.5 ms and CfL Lite about 0.4 ms.
+- They work with gpu-next and gpu, not Fast or Fastest. On a GeForce RTX 3060
+  at 1080p, where gpu-next debanding takes about 0.16 ms of GPU time per
+  frame, CfL adds about 0.5 ms and CfL Lite about 0.4 ms.
 - They start from the chroma plane the script rebuilds from the browser's
   RGB, which has already been through the browser's bilinear upscaling, so
   edges come out sharper than the browser's but a little softer than mpv's
@@ -134,8 +135,8 @@ WebGPU where the browser has it, otherwise WebGL2, otherwise WebGL1.
 
 - The WebGPU renderer runs the same passes with the shaders ported to WGSL.
   Given the same frame, gpu-next and CfL produce the same pixels as on WebGL2.
-  gpu and Fast differ by a code value or two in places, because their random
-  numbers come from float hashes that round differently on each API.
+  gpu, Fast and Fastest differ by a code value or two in places, because their
+  random numbers come from float hashes that round differently on each API.
 - WebGPU imports the video frame as an external texture instead of uploading
   a copy. Where a browser can't import video it copies the frame like WebGL2
   does (in the format set under **Upload**), which costs more.
@@ -167,6 +168,25 @@ result is close to gpu-next but not identical.
 On a GeForce RTX 3060 at 1080p, the debanding itself (without the frame upload
 that every mode shares) takes about a third of the GPU time of gpu-next on
 WebGL2, and a twentieth on WebGL1.
+
+If Fast still stutters, as it can on laptop integrated graphics, click
+**Fastest**. It runs Fast's debanding on a grid of half the resolution, one
+point per 2×2 block of pixels, and adds the change it makes there to every
+pixel; grain and dither stay per pixel. That cuts the scattered texture
+fetches, most of Fast's cost, to a quarter. Debanding changes a pixel by no
+more than the threshold and leaves edges alone, so working it out at half
+resolution loses little: Fastest removes about as much of the broad banding
+as gpu-next at the default settings, and 90% of what Fast removes at 4
+iterations, but leaves the finest, pixel-wide streaks, and its noise is
+softer.
+
+On an AMD Ryzen 5000 series integrated GPU (Radeon Vega) at 1080p60, Fastest's
+debanding takes about a quarter of Fast's GPU time at the default settings and
+a third at 4 iterations. What remains is mostly the browser copying each video
+frame for WebGL or WebGPU, which every mode pays: with default settings the
+GPU was 13.5% busy in Fastest and 15.4% in Fast, of which 11.4% was the copy.
+If video still stutters in Fastest, pick 720p in YouTube's quality menu, which
+more than halves both, and check that the browser decodes video in hardware.
 
 ## Compatibility
 
