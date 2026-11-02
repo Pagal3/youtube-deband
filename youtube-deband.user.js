@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube Deband (mpv / libplacebo)
 // @namespace    youtube-deband
-// @version      1.14.1
+// @version      1.14.2
 // @description  Debands YouTube video in WebGPU or WebGL using a port of mpv's deband shaders (vo=gpu-next / libplacebo and legacy vo=gpu), with mpv's parameters.
 // @match        *://*.youtube.com/*
 // @match        *://www.youtube-nocookie.com/*
@@ -58,7 +58,7 @@
     const PRESETS_KEY = 'yt-deband-presets'; // the user's own presets, apart so Reset keeps them
     const PANEL_POS_KEY = 'yt-deband-panel-pos'; // where the panel was dragged to, apart so Reset keeps it
     const SWITCH_KEY = 'yt-deband-codec-switch'; // in sessionStorage: { video, codec } switched to for one video
-    const VERSION = '1.14.1'; // keep in sync with @version
+    const VERSION = '1.14.2'; // keep in sync with @version
 
     // Option ranges match mpv's deband_conf (video/out/gpu/video_shaders.c)
     const DEFAULTS = {
@@ -2506,6 +2506,16 @@ fn upscaleChroma(p: vec2f, uv: vec2f, y: f32) -> vec2f { return cfl(p, y); }`;
             const has = new Set(formats.map((f) => family(f.mimeType)));
             return Object.keys(SAMPLE).filter((f) => has.has(f));
         };
+        // Those codecs, and whether there are none though the video plays
+        // and doesn't come from HLS: then the response isn't laid out the
+        // way this reads it, and YouTube has likely changed it
+        const offer = (response) => {
+            const codecs = codecsIn(response);
+            const ok = response && response.playabilityStatus && response.playabilityStatus.status === 'OK';
+            const hls = response && response.streamingData && response.streamingData.hlsManifestUrl;
+            return { codecs, unreadable: !codecs.length && !!ok && !hls };
+        };
+        let warned = false;
         // By video ID: the codecs it comes in, from before any were dropped,
         // and whether they were
         const seen = new Map();
@@ -2516,7 +2526,13 @@ fn upscaleChroma(p: vec2f, uv: vec2f, y: f32) -> vec2f { return cfl(p, y); }`;
         const steer = (response) => {
             try {
                 const id = response && response.videoDetails && response.videoDetails.videoId;
-                const codecs = codecsIn(response);
+                const { codecs, unreadable } = offer(response);
+                if (id && unreadable) {
+                    seen.set(id, { codecs, steered: false, unreadable });
+                    if (!warned)
+                        console.warn('[yt-deband] Can\'t find the video formats in YouTube\'s player response, so codecs can\'t be switched. YouTube may have changed it.');
+                    warned = true;
+                }
                 if (!id || !codecs.length)
                     return false;
                 const s = stored(sessionStorage, switchKey);
@@ -2593,13 +2609,14 @@ fn upscaleChroma(p: vec2f, uv: vec2f, y: f32) -> vec2f { return cfl(p, y); }`;
                 if (!player || !player.getVideoData)
                     return;
                 const id = player.getVideoData().video_id;
-                const known = seen.get(id) || { codecs: codecsIn(player.getPlayerResponse && player.getPlayerResponse()), steered: false };
+                const known = seen.get(id) || { ...offer(player.getPlayerResponse && player.getPlayerResponse()), steered: false };
                 v.setAttribute('data-yt-deband-codec', JSON.stringify({
                     codec: /codecs\s*=\s*"?\s*([^",]+)/i.exec(type)[1].trim(),
                     family: f,
                     video: id,
                     offered: known.codecs,
                     steered: known.steered,
+                    unreadable: !!known.unreadable,
                     playable: Object.keys(SAMPLE).filter(plays),
                 }));
                 v.dispatchEvent(new Event('yt-deband-codec', { bubbles: true }));
@@ -2649,7 +2666,8 @@ fn upscaleChroma(p: vec2f, uv: vec2f, y: f32) -> vec2f { return cfl(p, y); }`;
     // What the main <video> plays, as pageCodecs put it: { codec (as in its
     // MIME type), family ('av1', 'vp9', 'h264', 'other'), video (ID),
     // offered and playable (codec families), steered (whether formats were
-    // dropped) }, or null
+    // dropped), unreadable (whether the player response listed no formats
+    // though the video plays) }, or null
     function codecInfo() {
         try {
             return video && JSON.parse(video.getAttribute('data-yt-deband-codec'));
@@ -2701,10 +2719,29 @@ fn upscaleChroma(p: vec2f, uv: vec2f, y: f32) -> vec2f { return cfl(p, y); }`;
         refreshPanel();
     }, true);
 
+    // The player's <video>. If YouTube renames the player's classes, the
+    // largest video on the page that has a picture, so debanding outlives
+    // the selectors (small ones are thumbnails' hover previews).
+    function findVideo() {
+        const v = document.querySelector('video.html5-main-video') || document.querySelector('#movie_player video');
+        if (v)
+            return v;
+        let best = null, bestArea = 320 * 180;
+        for (const e of document.querySelectorAll('video')) {
+            const box = e.getBoundingClientRect();
+            const area = box.width * box.height;
+            if (e.readyState >= 1 && area >= bestArea) {
+                best = e;
+                bestArea = area;
+            }
+        }
+        return best;
+    }
+
     // YouTube is a single page app and may swap the <video> element
     setInterval(() => {
         ensurePlayerButton();
-        const v = document.querySelector('video.html5-main-video') || document.querySelector('#movie_player video');
+        const v = findVideo();
         if (v !== video) {
             if (v)
                 attach(v);
@@ -3246,12 +3283,15 @@ a:hover { text-decoration: underline; }
                 CODECS.forEach(([c, text], i) => {
                     const why = !info ? '' : ad ? 'Wait for the ad to end'
                         : !info.playable.includes(c) ? `This browser can't play ${text}`
+                        : info.unreadable ? 'YouTube\'s player response can\'t be read'
                         : !info.offered.includes(c) ? `This video doesn't come in ${text}` : '';
                     buttons[i].disabled = !info || !!why;
                     buttons[i].title = why || (info ? `Play this video in ${text}` : '');
                     buttons[i].setAttribute('aria-checked', !!info && info.family === c && !codecSwitching);
                 });
                 playing.textContent = codecSwitching ? `Switching to ${codecSwitching === 'auto' ? 'YouTube\'s pick' : name(codecSwitching)}…`
+                    : info && info.unreadable ? `Playing ${info.family === 'other' ? info.codec : name(info.family)}. ` +
+                             'This video\'s formats can\'t be found in YouTube\'s player response, so its codec can\'t be switched. YouTube may have changed it.'
                     : info ? `Playing ${info.family === 'other' ? info.codec : name(info.family)}. ` +
                              'The buttons switch this video; the next plays in the preferred codec.'
                     : video && video.readyState >= 2 ? 'This player doesn\'t say which codec it plays, so it can\'t be switched here.'
