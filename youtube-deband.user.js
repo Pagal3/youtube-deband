@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube Deband (mpv / libplacebo)
 // @namespace    youtube-deband
-// @version      1.14.2
+// @version      1.15.0
 // @description  Debands YouTube video in WebGPU or WebGL using a port of mpv's deband shaders (vo=gpu-next / libplacebo and legacy vo=gpu), with mpv's parameters.
 // @match        *://*.youtube.com/*
 // @match        *://www.youtube-nocookie.com/*
@@ -44,7 +44,8 @@
  *
  * Codecs: the player is steered to AV1, VP9 or H.264 by dropping the other
  * codecs' formats from YouTube's player responses, from a script run in the
- * page's own JavaScript world (see the Codecs section).
+ * page's own JavaScript world (see the Codecs section). The preferred quality
+ * is set from there too, through the player's own API.
  *
  * Hotkeys (default): Ctrl+Alt+D toggles debanding, Ctrl+Alt+B opens the
  * settings panel; both can be re-recorded in the panel. The DB button in the
@@ -58,7 +59,7 @@
     const PRESETS_KEY = 'yt-deband-presets'; // the user's own presets, apart so Reset keeps them
     const PANEL_POS_KEY = 'yt-deband-panel-pos'; // where the panel was dragged to, apart so Reset keeps it
     const SWITCH_KEY = 'yt-deband-codec-switch'; // in sessionStorage: { video, codec } switched to for one video
-    const VERSION = '1.14.2'; // keep in sync with @version
+    const VERSION = '1.15.0'; // keep in sync with @version
 
     // Option ranges match mpv's deband_conf (video/out/gpu/video_shaders.c)
     const DEFAULTS = {
@@ -77,6 +78,7 @@
                             // Browsers hand over the frame as 8-bit RGB, so RGBA16F gains nothing
         backend: 'auto',    // 'auto' | 'webgpu' | 'webgl2' | 'webgl1'
         codec: 'auto',      // video codec to steer YouTube to: 'auto' (its own pick) | 'av1' | 'vp9' | 'h264'
+        quality: 'auto',    // quality to play videos in: 'auto' (YouTube's pick) | 'highest' | a QUALITIES level
         hotkeyToggle: 'Ctrl+Alt+d',
         hotkeyPanel: 'Ctrl+Alt+b',
         split: false,       // left half original, right half debanded
@@ -2450,9 +2452,20 @@ fn upscaleChroma(p: vec2f, uv: vec2f, y: f32) -> vec2f { return cfl(p, y); }`;
     // see: pageCodecs reads the settings from storage, puts what a <video>
     // plays in its data-yt-deband-codec attribute with a yt-deband-codec
     // event, and reloads a video in place on a yt-deband-reload event.
+    //
+    // The preferred quality needs no steering: the player's own
+    // setPlaybackQualityRange sets it, and pageCodecs calls that once a
+    // video plays, and on a yt-deband-quality event when the preference
+    // changes. No formats are dropped, so YouTube's quality menu stays whole
+    // and a pick there holds for that video.
     // ------------------------------------------------------------------
 
     const CODECS = [['av1', 'AV1'], ['vp9', 'VP9'], ['h264', 'H.264']];
+    // The player's quality levels that can be preferred, best first
+    const QUALITIES = [
+        ['highres', '4320p (8K)'], ['hd2880', '2880p (5K)'], ['hd2160', '2160p (4K)'], ['hd1440', '1440p'], ['hd1080', '1080p'], ['hd720', '720p'],
+        ['large', '480p'], ['medium', '360p'], ['small', '240p'], ['tiny', '144p'],
+    ];
 
     // Runs fn(...args) in the page's JavaScript world. fn goes over as
     // source, so it can only use its arguments. YouTube's CSP lets an inline
@@ -2472,9 +2485,9 @@ fn upscaleChroma(p: vec2f, uv: vec2f, y: f32) -> vec2f { return cfl(p, y); }`;
         script.remove();
     }
 
-    // Steers YouTube's codec choice and reports what each player plays.
-    // Runs in the page's world (see runInPage).
-    function pageCodecs(settingsKey, switchKey) {
+    // Steers YouTube's codec choice, sets the preferred quality and reports
+    // what each player plays. Runs in the page's world (see runInPage).
+    function pageCodecs(settingsKey, switchKey, qualities) {
         const MS = window.MediaSource;
         if (!MS || window.ytDebandCodecs)
             return;
@@ -2638,6 +2651,23 @@ fn upscaleChroma(p: vec2f, uv: vec2f, y: f32) -> vec2f { return cfl(p, y); }`;
             };
         }
 
+        // By player: the quality last set, as { video, wanted, level }
+        const qualitySet = new WeakMap();
+        // Sets a player to a quality, or the best below it if the video
+        // doesn't reach it. Returns whether the player had levels yet.
+        const setQuality = (player, wanted) => {
+            const levels = player.getAvailableQualityLevels().filter((q) => q !== 'auto');
+            if (!levels.length)
+                return false;
+            const within = (q) => qualities.includes(q) && qualities.indexOf(q) >= qualities.indexOf(wanted);
+            const level = wanted === 'auto' ? 'auto'
+                : wanted === 'highest' ? levels[0]
+                : levels.find(within) || levels[levels.length - 1];
+            player.setPlaybackQualityRange(level, level);
+            qualitySet.set(player, { video: player.getVideoData().video_id, wanted, level });
+            return true;
+        };
+
         // Loads a player's video again where it was, so the player picks its
         // codec anew; a paused video stays paused
         document.addEventListener('yt-deband-reload', (e) => {
@@ -2646,7 +2676,15 @@ fn upscaleChroma(p: vec2f, uv: vec2f, y: f32) -> vec2f { return cfl(p, y); }`;
                 return;
             const data = player.getVideoData();
             const paused = player.getPlayerState() === 2;
+            // Loading forgets a set quality, and YouTube would adapt again.
+            // What was asked for goes back, not what it came to, which
+            // another codec may not have offered more than.
+            const set = qualitySet.get(player);
+            const level = player.getPreferredQuality();
+            const wanted = set && set.level === level ? set.wanted : level;
             player.loadVideoById(data.video_id, data.isLive ? undefined : player.getCurrentTime());
+            if (wanted !== 'auto')
+                e.target.addEventListener('playing', () => setQuality(player, wanted), { once: true });
             if (paused) {
                 const since = performance.now();
                 e.target.addEventListener('playing', () => {
@@ -2655,12 +2693,38 @@ fn upscaleChroma(p: vec2f, uv: vec2f, y: f32) -> vec2f { return cfl(p, y); }`;
                 }, { once: true });
             }
         });
+
+        // The preferred quality, once per video so a pick in YouTube's menu
+        // holds. Auto leaves the player alone, and so do ads and the previews
+        // that play over thumbnails.
+        document.addEventListener('playing', (e) => {
+            try {
+                const player = e.target.closest('.html5-video-player');
+                if (!player || !player.setPlaybackQualityRange || player.id === 'inline-preview-player' || player.classList.contains('ad-showing'))
+                    return;
+                const set = qualitySet.get(player);
+                const wanted = stored(localStorage, settingsKey).quality;
+                if (wanted && wanted !== 'auto' && !(set && set.video === player.getVideoData().video_id))
+                    setQuality(player, wanted);
+            } catch (err) { /* plays as YouTube picks */ }
+        }, true);
+        // A new preference applies to the video at once, or after its ad
+        document.addEventListener('yt-deband-quality', (e) => {
+            try {
+                const player = e.target.closest('.html5-video-player');
+                if (!player || !player.setPlaybackQualityRange)
+                    return;
+                qualitySet.delete(player);
+                if (!player.classList.contains('ad-showing'))
+                    setQuality(player, stored(localStorage, settingsKey).quality || 'auto');
+            } catch (err) { /* plays as YouTube picks */ }
+        });
     }
 
     try {
-        runInPage(pageCodecs, STORAGE_KEY, SWITCH_KEY);
+        runInPage(pageCodecs, STORAGE_KEY, SWITCH_KEY, QUALITIES.map(([q]) => q));
     } catch (e) {
-        console.error('[yt-deband] codec switching unavailable:', e);
+        console.error('[yt-deband] codec and quality switching unavailable:', e);
     }
 
     // What the main <video> plays, as pageCodecs put it: { codec (as in its
@@ -2717,6 +2781,12 @@ fn upscaleChroma(p: vec2f, uv: vec2f, y: f32) -> vec2f { return cfl(p, y); }`;
             return;
         codecSwitching = null;
         refreshPanel();
+    }, true);
+
+    // The player changes the <video>'s size when it changes quality
+    document.addEventListener('resize', (e) => {
+        if (e.target === video)
+            refreshPanel();
     }, true);
 
     // The player's <video>. If YouTube renames the player's classes, the
@@ -2787,6 +2857,8 @@ fn upscaleChroma(p: vec2f, uv: vec2f, y: f32) -> vec2f { return cfl(p, y); }`;
         saveSettings();
         if ('codec' in values)
             codecPreferenceChanged();
+        if ('quality' in values && video)
+            video.dispatchEvent(new Event('yt-deband-quality', { bubbles: true }));
         refreshPanel();
         // A canvas keeps its first context type, so a backend switch needs a
         // new one. Picking a renderer also gives WebGPU another chance.
@@ -3302,6 +3374,25 @@ a:hover { text-decoration: underline; }
             };
             return root;
         };
+        // The quality to prefer for every video, and the size playing now
+        const qualityPicker = () => {
+            const select = el('select', {
+                'aria-label': 'Preferred quality',
+                onchange: (e) => applySetting('quality', e.target.value),
+            }, ...[['auto', 'Auto'], ['highest', 'Highest'], ...QUALITIES].map(([v, text]) => el('option', { value: v, textContent: text })));
+            const about = el('div', { className: 'about' });
+            const root = el('div', null,
+                el('div', { className: 'row' }, el('span', { textContent: 'Preferred' }), select),
+                about);
+            root.refresh = (preferred) => {
+                select.value = preferred;
+                const size = video && video.videoHeight ? `Playing ${video.videoWidth}×${video.videoHeight}. ` : '';
+                about.textContent = size + (preferred === 'auto' ? 'YouTube picks the quality, and changes it to suit the connection.'
+                    : preferred === 'highest' ? 'The best each video comes in, held as if picked in YouTube\'s quality menu, so a slow connection buffers.'
+                    : 'Held as if picked in YouTube\'s quality menu, so a slow connection buffers. Videos that don\'t reach it play in the best they have.');
+            };
+            return root;
+        };
 
         const enabled = toggle('enabled');
         const state = el('span', { className: 'state' });
@@ -3337,6 +3428,7 @@ a:hover { text-decoration: underline; }
                 ['vp9', 'VP9', 'Decoded by the GPU on most systems from 2016 on, and offered up to 4K and beyond.'],
                 ['h264', 'H.264', 'Decoded by the GPU nearly everywhere, but YouTube usually offers it only up to 1080p, and it takes the most data.'],
             ]),
+            quality: qualityPicker(),
             matrix: choice('matrix', [
                 ['709', 'BT.709', 'The matrix of HD video, and of most video on YouTube.'],
                 ['601', 'BT.601', 'For SD videos encoded as BT.601, which need it for exact colors.'],
@@ -3413,6 +3505,7 @@ a:hover { text-decoration: underline; }
                     line('Split compare', 'Left half original, right half debanded', inputs.split))),
             picture: el('div', null,
                 group('Codec', false, inputs.codec),
+                group('Quality', false, inputs.quality),
                 group('Chroma upscaling', true, inputs.chroma),
                 group('YCbCr matrix', false, inputs.matrix),
                 group(null, false,

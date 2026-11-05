@@ -16,13 +16,13 @@ stream of Sintel at 0:35, default settings; more in [Comparison](#comparison).</
 - mpv's four deband parameters, presets, and import from your own `mpv.conf`
 - Optional **CfL** chroma upscaling, ported from the shaders mpv users load
 - Switching the video between YouTube's **AV1**, **VP9** and **H.264** streams,
-  and a preferred codec for every video
+  and a preferred codec and quality for every video
 - Renders with WebGPU, WebGL2 or WebGL1, so it also runs in Tor and Mullvad Browser
 - A settings panel in the player and a split-screen comparison view
 
 **Contents:** [Install](#install) · [Usage](#usage) · [Comparison](#comparison) ·
 [Modes](#modes) · [Chroma upscaling](#chroma-upscaling) · [Codecs](#codecs) ·
-[Renderers](#renderers) · [Compatibility](#compatibility) · [How it works](#how-it-works) ·
+[Quality](#quality) · [Renderers](#renderers) · [Compatibility](#compatibility) · [How it works](#how-it-works) ·
 [License](#license)
 
 ## Install
@@ -46,15 +46,15 @@ Both shortcuts can be re-recorded on the panel's **Advanced** tab.
 
 <p>
   <img src="docs/panel-deband.png" width="372" align="top" alt="Settings panel, Deband tab: mode, preset, the four parameters and split compare">
-  <img src="docs/panel-picture.png" width="372" align="top" alt="Settings panel, Picture tab: codec, chroma upscaling, YCbCr matrix, luma snapping and dither">
+  <img src="docs/panel-picture.png" width="372" align="top" alt="Settings panel, Picture tab: codec, quality, chroma upscaling, YCbCr matrix, luma snapping and dither">
 </p>
 
 The panel has three tabs:
 
 - **Deband**: the mode, presets, the four parameters and the split-screen
   comparison
-- **Picture**: the video codec, chroma upscaling, the YCbCr matrix (709/601),
-  luma snapping and output dithering
+- **Picture**: the video codec, the preferred quality, chroma upscaling, the
+  YCbCr matrix (709/601), luma snapping and output dithering
 - **Advanced**: the renderer, upload precision, shortcuts, importing mpv
   options and resetting
 
@@ -255,6 +255,31 @@ removing the other codecs' streams from the list it picks from, and doesn't
 touch what the browser reports it can play, which the ads and YouTube's own
 capability checks rely on.
 
+## Quality
+
+**Quality** on the Picture tab picks the quality for every video, and shows
+the size of the video playing. Changing it applies to the video you're
+watching straight away.
+
+- **Auto** (the default) leaves it to YouTube, which goes by your connection
+  and the size of the player.
+- **Highest** plays the best each video comes in.
+- **144p** to **4320p** plays that quality. Videos that don't reach it play in
+  the best they have, so 1440p on a 1080p video plays 1080p.
+
+The quality is held, as when you pick one in YouTube's own quality menu, so on
+a slow connection the video buffers instead of dropping to a lower one. That
+menu keeps working: a pick there lasts for that video, also when you switch
+its codec, and the next one plays in the preferred quality.
+
+The codec counts too: H.264 usually stops at 1080p, so a preferred H.264 caps
+the quality there. Ads and the previews that play over thumbnails are left
+alone.
+
+Another extension that sets the quality, such as Video Quality Fixer for
+YouTube, overrides this one, since the script takes any later change for a
+pick in YouTube's menu. Use one or the other.
+
 ## Renderers
 
 **Renderer** on the Advanced tab picks the graphics API. **Auto** (the
@@ -303,8 +328,8 @@ data resets them.
 
 Watch pages, theater mode, fullscreen and embeds (including
 youtube-nocookie.com). YouTube Music is excluded. Shorts and m.youtube.com
-are untested, and on mobile there is no DB button. Codec switching is
-untested in embeds.
+are untested, and on mobile there is no DB button. Codec switching and the
+preferred quality are untested in embeds.
 
 ### Videos it skips
 
