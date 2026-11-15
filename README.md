@@ -4,10 +4,11 @@ A userscript that removes color banding from YouTube video in the browser, using
 WebGPU and WebGL ports of [mpv](https://mpv.io/)'s deband shaders with mpv's own
 parameters.
 
-![Original vs debanded, foggy sky](docs/sky.png)
+![Original vs debanded, desert sky, with a contrast-boosted row below](docs/deband-sky.png)
 
-<sub>Left half: the video as the browser shows it. Right half: debanded. YouTube's 720p
-stream of Sintel at 0:35, default settings; more in [Comparison](#comparison).</sub>
+<sub>Left: the video as the browser shows it. Right: debanded with the default settings.
+The bottom row stretches the contrast 5× so the steps show on any screen. YouTube's
+1080p stream of Sintel at 6:10, at its own pixel size; more in [Comparison](#comparison).</sub>
 
 **Features**
 
@@ -45,8 +46,9 @@ Both shortcuts can be re-recorded on the panel's **Advanced** tab.
 ### Settings panel
 
 <p>
-  <img src="docs/panel-deband.png" width="372" align="top" alt="Settings panel, Deband tab: mode, preset, the four parameters and split compare">
-  <img src="docs/panel-picture.png" width="372" align="top" alt="Settings panel, Picture tab: codec, quality, chroma upscaling, YCbCr matrix, luma snapping and dither">
+  <img src="docs/panel-deband.png" width="270" align="top" alt="Settings panel, Deband tab: mode, preset, the four parameters and split compare">
+  <img src="docs/panel-picture.png" width="270" align="top" alt="Settings panel, Picture tab: codec, quality, chroma upscaling, YCbCr matrix, luma snapping, dither and Smooth Ambient mode">
+  <img src="docs/panel-advanced.png" width="270" align="top" alt="Settings panel, Advanced tab: renderer, upload format, shortcuts, import from mpv and reset">
 </p>
 
 The panel has three tabs:
@@ -120,25 +122,23 @@ example one for network streams, which is what YouTube is.
 
 ## Comparison
 
-Banding is easiest to see with the contrast boosted (both halves get the same
-curve). Left half original, right half debanded:
+Each image shows the same part of one frame of YouTube's 1080p stream of
+Sintel, at its own pixel size: original on the left, debanded with the default
+settings on the right. Banding is a step of one or two code values, which is
+easy to miss in a screenshot on a bright screen but hard to unsee on a large
+one in a dark room, so the bottom row stretches the contrast of both sides by
+the same factor.
 
-![Original vs debanded, contrast boosted](docs/sky-boosted.png)
+Fog at 0:38, where the original turns out to be a patchwork of flat blocks:
 
-![Original vs debanded, sunset at 5:10, contrast boosted](docs/sunset-boosted.png)
+![Original vs debanded, fog, with a contrast-boosted row below](docs/deband-fog.png)
+
+A dark cave at 10:40. Near-black areas band the most, since the encoder spends
+the fewest bits there:
+
+![Original vs debanded, dark cave, with a contrast-boosted row below](docs/deband-dark.png)
 
 <sub>Sintel © Blender Foundation, [CC BY 3.0](https://creativecommons.org/licenses/by/3.0/), [durian.blender.org](https://durian.blender.org)</sub>
-
-Near-black backgrounds band too. A talking-head video at 720p, 0:10:
-
-![Original vs debanded, dark background](docs/dark.png)
-
-With the darkest 8% stretched to full range, the original's background turns
-out to be a few flat blocks of brightness:
-
-![Original vs debanded, dark background, shadows lifted](docs/dark-boosted.png)
-
-<sub>Frame from [the largest hack. ever.](https://www.youtube.com/watch?v=_HaySrzDyWU) by voidzilla</sub>
 
 ## Modes
 
@@ -289,6 +289,12 @@ Shorts, and in fullscreen when the video doesn't fill the screen. It bands
 badly, and not because of the video: YouTube draws a blurred storyboard
 thumbnail into a canvas of about 110×75 pixels and lets the browser stretch
 it over an area up to twice the player's size, rounding the result to 8 bits.
+
+![YouTube's Ambient mode glow vs the smoothed one, plain and contrast boosted](docs/ambient.png)
+
+<sub>The glow left of the player in theater mode, Big Buck Bunny at 2:27, paused.
+Left to right: YouTube's, smoothed, and both with the contrast stretched 5×.
+Big Buck Bunny © Blender Foundation, [CC BY 3.0](https://creativecommons.org/licenses/by/3.0/).</sub>
 
 **Smooth Ambient mode** on the Picture tab (on by default) redraws it on a
 canvas of its own at the screen's resolution, from YouTube's own small
