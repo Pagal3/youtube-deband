@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube Deband (mpv / libplacebo)
 // @namespace    youtube-deband
-// @version      1.15.0
+// @version      1.16.0
 // @description  Debands YouTube video in WebGPU or WebGL using a port of mpv's deband shaders (vo=gpu-next / libplacebo and legacy vo=gpu), with mpv's parameters.
 // @match        *://*.youtube.com/*
 // @match        *://www.youtube-nocookie.com/*
@@ -47,6 +47,10 @@
  * page's own JavaScript world (see the Codecs section). The preferred quality
  * is set from there too, through the player's own API.
  *
+ * Ambient mode: YouTube's glow around the player is redrawn from its own
+ * tiny canvases, upscaled smoothly and dithered (see the Ambient mode
+ * section).
+ *
  * Hotkeys (default): Ctrl+Alt+D toggles debanding, Ctrl+Alt+B opens the
  * settings panel; both can be re-recorded in the panel. The DB button in the
  * player's control bar also opens the panel.
@@ -59,7 +63,7 @@
     const PRESETS_KEY = 'yt-deband-presets'; // the user's own presets, apart so Reset keeps them
     const PANEL_POS_KEY = 'yt-deband-panel-pos'; // where the panel was dragged to, apart so Reset keeps it
     const SWITCH_KEY = 'yt-deband-codec-switch'; // in sessionStorage: { video, codec } switched to for one video
-    const VERSION = '1.15.0'; // keep in sync with @version
+    const VERSION = '1.16.0'; // keep in sync with @version
 
     // Option ranges match mpv's deband_conf (video/out/gpu/video_shaders.c)
     const DEFAULTS = {
@@ -79,6 +83,7 @@
         backend: 'auto',    // 'auto' | 'webgpu' | 'webgl2' | 'webgl1'
         codec: 'auto',      // video codec to steer YouTube to: 'auto' (its own pick) | 'av1' | 'vp9' | 'h264'
         quality: 'auto',    // quality to play videos in: 'auto' (YouTube's pick) | 'highest' | a QUALITIES level
+        ambient: true,      // redraw YouTube's Ambient mode glow smoothly, without banding
         hotkeyToggle: 'Ctrl+Alt+d',
         hotkeyPanel: 'Ctrl+Alt+b',
         split: false,       // left half original, right half debanded
@@ -2823,6 +2828,398 @@ fn upscaleChroma(p: vec2f, uv: vec2f, y: f32) -> vec2f { return cfl(p, y); }`;
     }, 1000);
 
     // ------------------------------------------------------------------
+    // Ambient mode
+    //
+    // YouTube's Ambient mode isn't drawn from the video: it draws the
+    // current storyboard thumbnail, blurred and at 40% over the page's
+    // background, into a canvas about 110x75 pixels, crossfades it in over
+    // the previous one (a second canvas behind it), and has the browser
+    // stretch the pair over an area 1.5 to 2 times the player's. That
+    // stretch is bilinear and rounded to 8 bits, so the faint gradients come
+    // out as wide steps with creases between them.
+    //
+    // This redraws the pair onto a canvas of its own at the screen's
+    // resolution: a cubic B-spline upscale (smooth, without bilinear's
+    // creases) and the crossfade worked out in float, then dithered to 8
+    // bits. YouTube's canvases stay where they are, hidden, and keep being
+    // read. Reading them needs them untainted, so the storyboard images are
+    // loaded with CORS, which i.ytimg.com allows, from the page's world.
+    // ------------------------------------------------------------------
+
+    // Runs in the page's world (see runInPage). Loads storyboard images with
+    // CORS, and fires yt-deband-ambient on a canvas of an Ambient mode pair
+    // whenever it is drawn on. A pair is recognized by its first blurred
+    // draw or draw of a storyboard, and its parent is marked.
+    function pageAmbient() {
+        if (window.ytDebandAmbient || !window.CanvasRenderingContext2D)
+            return;
+        window.ytDebandAmbient = true;
+        const STORYBOARD = /^(https?:)?\/\/i\d*\.ytimg\.com\/sb\//;
+        const src = Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, 'src');
+        if (src && src.set && src.configurable) {
+            // Should a storyboard ever refuse CORS, it loads as before, and
+            // that Ambient mode stays YouTube's own
+            const retried = new WeakSet();
+            Object.defineProperty(HTMLImageElement.prototype, 'src', {
+                configurable: true,
+                enumerable: src.enumerable,
+                get: src.get,
+                set(v) {
+                    try {
+                        if (this.crossOrigin === null && STORYBOARD.test(String(v))) {
+                            this.crossOrigin = 'anonymous';
+                            this.addEventListener('error', () => {
+                                if (retried.has(this))
+                                    return;
+                                retried.add(this);
+                                this.removeAttribute('crossorigin');
+                                src.set.call(this, v);
+                            }, { once: true });
+                        }
+                    } catch (e) { /* loads as YouTube asked */ }
+                    src.set.call(this, v);
+                },
+            });
+        }
+
+        const BLUR = /^blur\((?!0(px)?\))/;
+        const pairs = new WeakSet();
+        const pending = new Set();
+        const flush = () => {
+            for (const c of pending)
+                c.dispatchEvent(new Event('yt-deband-ambient', { bubbles: true }));
+            pending.clear();
+        };
+        const drawn = (ctx, canMark, source) => {
+            const c = ctx.canvas;
+            if (!pairs.has(c)) {
+                if (!canMark || !c.parentElement)
+                    return;
+                const storyboard = source instanceof HTMLImageElement && STORYBOARD.test(source.src);
+                if (!storyboard && !BLUR.test(ctx.filter || ''))
+                    return;
+                for (const s of c.parentElement.children) {
+                    if (s instanceof HTMLCanvasElement)
+                        pairs.add(s);
+                }
+                c.parentElement.setAttribute('data-yt-deband-ambient', '');
+            }
+            if (!pending.size)
+                queueMicrotask(flush);
+            pending.add(c);
+        };
+        const P = CanvasRenderingContext2D.prototype;
+        for (const [name, canMark] of [['drawImage', true], ['fillRect', true], ['clearRect', false], ['putImageData', false]]) {
+            const f = P[name];
+            P[name] = function (source) {
+                const result = f.apply(this, arguments);
+                try {
+                    drawn(this, canMark, source);
+                } catch (e) { /* only a notice */ }
+                return result;
+            };
+        }
+    }
+
+    try {
+        runInPage(pageAmbient);
+    } catch (e) {
+        console.error('[yt-deband] Ambient mode smoothing unavailable:', e);
+    }
+
+    // GLSL ES 1.00, which WebGL2 runs too. Samples a premultiplied pair with
+    // a cubic B-spline from 16 nearest texels (8-bit textures may filter
+    // with only 8 bits of weight), crossfades it the way the browser
+    // composites it, and dithers to 8 bits. Exact code values, such as the
+    // flat background around the glow, come out unchanged.
+    const AMBIENT_VS = `
+attribute vec2 a_pos;
+void main() { gl_Position = vec4(a_pos, 0.0, 1.0); }`;
+    const AMBIENT_FS = `
+#ifdef GL_FRAGMENT_PRECISION_HIGH
+precision highp float;
+#else
+precision mediump float;
+#endif
+uniform sampler2D u_back, u_front;
+uniform vec2 u_size, u_out;
+uniform float u_opBack, u_opFront;
+
+vec4 texel(sampler2D t, vec2 i) {
+    return texture2D(t, (clamp(i, vec2(0.0), u_size - 1.0) + 0.5) / u_size);
+}
+vec4 row(sampler2D t, vec2 i, vec4 wx) {
+    return texel(t, i + vec2(-1.0, 0.0)) * wx.x + texel(t, i) * wx.y +
+           texel(t, i + vec2(1.0, 0.0)) * wx.z + texel(t, i + vec2(2.0, 0.0)) * wx.w;
+}
+vec4 bspline(sampler2D t, vec2 p) {
+    vec2 q = p - 0.5;
+    vec2 i = floor(q);
+    vec2 f = q - i, f2 = f * f, f3 = f2 * f;
+    vec2 w0 = (1.0 - 3.0 * f + 3.0 * f2 - f3) / 6.0;
+    vec2 w1 = (4.0 - 6.0 * f2 + 3.0 * f3) / 6.0;
+    vec2 w2 = (1.0 + 3.0 * f + 3.0 * f2 - 3.0 * f3) / 6.0;
+    vec2 w3 = f3 / 6.0;
+    vec4 wx = vec4(w0.x, w1.x, w2.x, w3.x);
+    return row(t, i + vec2(0.0, -1.0), wx) * w0.y + row(t, i, wx) * w1.y +
+           row(t, i + vec2(0.0, 1.0), wx) * w2.y + row(t, i + vec2(0.0, 2.0), wx) * w3.y;
+}
+void main() {
+    // The canvases' top row is texture row 0
+    vec2 p = vec2(gl_FragCoord.x, u_out.y - gl_FragCoord.y) * u_size / u_out;
+    vec4 c = vec4(0.0);
+    if (u_opBack > 0.0)
+        c = bspline(u_back, p) * u_opBack;
+    if (u_opFront > 0.0) {
+        vec4 f = bspline(u_front, p) * u_opFront;
+        c = f + c * (1.0 - f.a);
+    }
+    float a = floor(c.a * 255.0 + 0.5) / 255.0;
+    float n = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
+    gl_FragColor = vec4(min(floor(c.rgb * 255.0 + n) / 255.0, vec3(a)), a);
+}`;
+    // The glow covers up to twice the player each way, so a big screen in
+    // theater mode would make a canvas of 8 MP and more. Past this many
+    // pixels it renders at a lower resolution and the browser scales it up;
+    // the content is so smooth that this loses next to nothing.
+    const AMBIENT_MAX_PIXELS = 4e6;
+
+    const AMBIENT_CONTEXT = {
+        alpha: true, premultipliedAlpha: true, antialias: false, depth: false, stencil: false,
+        preserveDrawingBuffer: false,
+    };
+
+    // One Ambient mode pair and the canvas drawn in its place
+    class AmbientView {
+        constructor(inner) {
+            this.inner = inner;
+            [this.back, this.front] = [...inner.children].filter((e) => e.tagName === 'CANVAS');
+            this.canvas = document.createElement('canvas');
+            this.canvas.className = 'yt-deband-ambient';
+            Object.assign(this.canvas.style, { position: 'absolute', pointerEvents: 'none', display: 'none', margin: '0' });
+            const gl = this.canvas.getContext('webgl2', AMBIENT_CONTEXT) || this.canvas.getContext('webgl', AMBIENT_CONTEXT);
+            if (!gl)
+                throw new Error('WebGL is not available');
+            this.gl = gl;
+            const compile = (type, source) => {
+                const sh = gl.createShader(type);
+                gl.shaderSource(sh, source);
+                gl.compileShader(sh);
+                if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS))
+                    throw new Error('Ambient shader compile failed: ' + gl.getShaderInfoLog(sh));
+                return sh;
+            };
+            const prog = gl.createProgram();
+            gl.attachShader(prog, compile(gl.VERTEX_SHADER, AMBIENT_VS));
+            gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, AMBIENT_FS));
+            gl.bindAttribLocation(prog, 0, 'a_pos');
+            gl.linkProgram(prog);
+            if (!gl.getProgramParameter(prog, gl.LINK_STATUS))
+                throw new Error('Ambient program link failed: ' + gl.getProgramInfoLog(prog));
+            gl.useProgram(prog);
+            this.loc = {};
+            for (const name of ['u_back', 'u_front', 'u_size', 'u_out', 'u_opBack', 'u_opFront'])
+                this.loc[name] = gl.getUniformLocation(prog, name);
+            gl.uniform1i(this.loc.u_back, 0);
+            gl.uniform1i(this.loc.u_front, 1);
+            this.textures = [0, 1].map((unit) => {
+                const tex = gl.createTexture();
+                gl.activeTexture(gl.TEXTURE0 + unit);
+                gl.bindTexture(gl.TEXTURE_2D, tex);
+                gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+                gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+                gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+                gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+                return tex;
+            });
+            gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
+            gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+            gl.enableVertexAttribArray(0);
+            gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+            gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+            gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, true);
+            gl.pixelStorei(gl.UNPACK_COLORSPACE_CONVERSION_WEBGL, gl.NONE);
+            this.canvas.addEventListener('webglcontextlost', () => this.destroy());
+
+            inner.after(this.canvas);
+            this.raf = null;
+            this.placed = false;
+            // YouTube sets the pair's size and scale in its inline style;
+            // resizing the page or the player resizes it
+            const replace = () => {
+                this.placed = false;
+                this.request();
+            };
+            this.observers = [new ResizeObserver(replace), new MutationObserver(replace)];
+            this.observers[0].observe(inner);
+            this.observers[1].observe(inner, { attributes: true, attributeFilter: ['style'] });
+        }
+
+        // Draws on the next frame; changed says the pair or its box did,
+        // rather than only the crossfade moving on
+        request(changed = true) {
+            if (changed)
+                this.changed = true;
+            if (this.raf === null && this.gl)
+                this.raf = requestAnimationFrame(() => {
+                    this.raf = null;
+                    this.draw();
+                });
+        }
+
+        // Shows this canvas instead of YouTube's pair, or the pair again
+        show(on) {
+            this.canvas.style.display = on ? 'block' : 'none';
+            // Only on a change: the style observer would draw again
+            const visibility = on ? 'hidden' : '';
+            if (this.inner.style.visibility !== visibility)
+                this.inner.style.visibility = visibility;
+        }
+
+        // Lays the canvas over the pair's box, edges on device pixels, and
+        // sizes it to the screen's pixels there. Returns false if the pair
+        // isn't laid out.
+        place() {
+            const rect = this.inner.getBoundingClientRect();
+            if (rect.width < 1 || rect.height < 1)
+                return false;
+            const c = this.canvas;
+            // The origin the canvas is positioned from
+            Object.assign(c.style, { display: 'block', left: '0px', top: '0px' });
+            const origin = c.getBoundingClientRect();
+            const dpr = devicePixels || window.devicePixelRatio || 1;
+            const [l, t, r, b] = [rect.left, rect.top, rect.right, rect.bottom].map((v) => Math.round(v * dpr) / dpr);
+            const scale = Math.min(1, Math.sqrt(AMBIENT_MAX_PIXELS / ((r - l) * (b - t) * dpr * dpr)));
+            Object.assign(c.style, {
+                left: l - origin.left + 'px', top: t - origin.top + 'px',
+                width: r - l + 'px', height: b - t + 'px',
+                filter: getComputedStyle(this.inner).filter,
+            });
+            const w = Math.max(1, Math.round((r - l) * dpr * scale));
+            const h = Math.max(1, Math.round((b - t) * dpr * scale));
+            if (c.width !== w || c.height !== h) {
+                c.width = w;
+                c.height = h;
+            }
+            this.placed = true;
+            return true;
+        }
+
+        draw() {
+            if (!this.gl)
+                return;
+            const ready = settings.enabled && settings.ambient && this.inner.isConnected &&
+                          this.back.width > 0 && this.back.height > 0 &&
+                          this.front.width === this.back.width && this.front.height === this.back.height;
+            if (!ready || (!this.placed && !this.place()))
+                return this.show(false);
+            const gl = this.gl;
+            const opacity = (e) => parseFloat(getComputedStyle(e).opacity);
+            const opFront = opacity(this.front);
+            // An opaque front covers the back
+            const opBack = opFront < 1 ? opacity(this.back) : 0;
+            // Follow the crossfade to its end, drawing only when it moves (it
+            // may go in steps, and displays may refresh far faster)
+            if (this.front.getAnimations().length)
+                this.request(false);
+            const same = !this.changed && opFront === this.opFront && opBack === this.opBack;
+            this.changed = false;
+            this.opFront = opFront;
+            this.opBack = opBack;
+            if (same)
+                return;
+            try {
+                [this.back, this.front].forEach((source, unit) => {
+                    gl.activeTexture(gl.TEXTURE0 + unit);
+                    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, source);
+                });
+            } catch (e) {
+                // Tainted: something drawn on it came without CORS. That
+                // stays so for the canvas's life, so the pair stays YouTube's.
+                console.info('[yt-deband] Can\'t read this Ambient mode, leaving it as YouTube draws it:', e.message);
+                return this.destroy();
+            }
+            gl.viewport(0, 0, this.canvas.width, this.canvas.height);
+            gl.uniform2f(this.loc.u_size, this.back.width, this.back.height);
+            gl.uniform2f(this.loc.u_out, this.canvas.width, this.canvas.height);
+            gl.uniform1f(this.loc.u_opBack, opBack);
+            gl.uniform1f(this.loc.u_opFront, opFront);
+            gl.drawArrays(gl.TRIANGLES, 0, 3);
+            this.show(true);
+        }
+
+        // Gives the pair back for good (until YouTube makes a new one)
+        destroy() {
+            if (!this.gl)
+                return;
+            if (this.raf !== null)
+                cancelAnimationFrame(this.raf);
+            for (const o of this.observers)
+                o.disconnect();
+            this.show(false);
+            this.canvas.remove();
+            const lose = this.gl.getExtension('WEBGL_lose_context');
+            this.gl = null;
+            if (lose)
+                lose.loseContext();
+        }
+    }
+
+    // By the pair's parent: its view, or null where it couldn't be set up
+    const ambientViews = new Map();
+    // Each WebGL context counts against the browser's limit (16 in
+    // Chromium), and pages normally have one Ambient mode
+    const AMBIENT_MAX_VIEWS = 4;
+
+    function ambientDrawn(inner) {
+        if (!settings.enabled || !settings.ambient || !inner || !inner.isConnected)
+            return;
+        let view = ambientViews.get(inner);
+        if (view === undefined) {
+            pruneAmbient();
+            const pair = [...inner.children].filter((e) => e.tagName === 'CANVAS');
+            if (ambientViews.size >= AMBIENT_MAX_VIEWS || pair.length !== 2 || !inner.parentElement ||
+                !pair.every((c) => c.style.position === 'absolute'))
+                return;
+            try {
+                view = new AmbientView(inner);
+            } catch (e) {
+                console.info('[yt-deband] Ambient mode left as YouTube draws it:', e.message);
+                view = null;
+            }
+            ambientViews.set(inner, view);
+        }
+        if (view)
+            view.request();
+    }
+
+    // Drops the views of pairs YouTube has taken off the page
+    function pruneAmbient() {
+        for (const [inner, view] of ambientViews) {
+            if (!inner.isConnected) {
+                if (view)
+                    view.destroy();
+                ambientViews.delete(inner);
+            }
+        }
+    }
+
+    // Settings changed: show or hide every view, and take on pairs drawn
+    // while it was off
+    function refreshAmbient() {
+        pruneAmbient();
+        for (const inner of document.querySelectorAll('[data-yt-deband-ambient]'))
+            ambientDrawn(inner);
+        for (const view of ambientViews.values()) {
+            if (view)
+                view.request();
+        }
+    }
+
+    document.addEventListener('yt-deband-ambient', (e) => ambientDrawn(e.target.parentElement), true);
+    setInterval(pruneAmbient, 5000);
+
+    // ------------------------------------------------------------------
     // Settings panel (built with DOM calls: YouTube enforces Trusted Types,
     // so innerHTML is not allowed)
     // ------------------------------------------------------------------
@@ -2859,6 +3256,8 @@ fn upscaleChroma(p: vec2f, uv: vec2f, y: f32) -> vec2f { return cfl(p, y); }`;
             codecPreferenceChanged();
         if ('quality' in values && video)
             video.dispatchEvent(new Event('yt-deband-quality', { bubbles: true }));
+        if ('enabled' in values || 'ambient' in values)
+            refreshAmbient();
         refreshPanel();
         // A canvas keeps its first context type, so a backend switch needs a
         // new one. Picking a renderer also gives WebGPU another chance.
@@ -3435,6 +3834,7 @@ a:hover { text-decoration: underline; }
             ]),
             snap: toggle('snap'),
             dither: toggle('dither'),
+            ambient: toggle('ambient'),
             backend: choice('backend', [
                 ['auto', 'Auto', 'WebGPU where the browser has it, otherwise WebGL2, otherwise WebGL1.'],
                 ['webgpu', 'WebGPU', 'Imports the video frame directly instead of uploading a copy of it.'],
@@ -3510,7 +3910,9 @@ a:hover { text-decoration: underline; }
                 group('YCbCr matrix', false, inputs.matrix),
                 group(null, false,
                     line('Snap luma', 'Round recovered luma to the 8-bit code grid, undoing the browser\'s RGB rounding.', inputs.snap, true),
-                    line('Dither', 'Dither the output down to 8 bits, as mpv does.', inputs.dither))),
+                    line('Dither', 'Dither the output down to 8 bits, as mpv does.', inputs.dither)),
+                group('Ambient mode', false,
+                    line('Smooth Ambient mode', 'Redraw the glow YouTube\'s Ambient mode puts around the player smoothly and dithered, without its banding. Follows the on/off switch.', inputs.ambient))),
             advanced: el('div', null,
                 group('Renderer', false, inputs.backend),
                 group('Upload format', true, inputs.precision),

@@ -54,7 +54,8 @@ The panel has three tabs:
 - **Deband**: the mode, presets, the four parameters and the split-screen
   comparison
 - **Picture**: the video codec, the preferred quality, chroma upscaling, the
-  YCbCr matrix (709/601), luma snapping and output dithering
+  YCbCr matrix (709/601), luma snapping, output dithering and smoothing
+  Ambient mode
 - **Advanced**: the renderer, upload precision, shortcuts, importing mpv
   options and resetting
 
@@ -280,6 +281,28 @@ Another extension that sets the quality, such as Video Quality Fixer for
 YouTube, overrides this one, since the script takes any later change for a
 pick in YouTube's menu. Use one or the other.
 
+## Ambient mode
+
+YouTube's Ambient mode is the colored glow around the player: on the sides in
+theater mode, under and around the player in the default view, around
+Shorts, and in fullscreen when the video doesn't fill the screen. It bands
+badly, and not because of the video: YouTube draws a blurred storyboard
+thumbnail into a canvas of about 110×75 pixels and lets the browser stretch
+it over an area up to twice the player's size, rounding the result to 8 bits.
+
+**Smooth Ambient mode** on the Picture tab (on by default) redraws it on a
+canvas of its own at the screen's resolution, from YouTube's own small
+canvases: a cubic B-spline upscale without bilinear stretching's creases, and
+YouTube's crossfade between thumbnails worked out in float, then dithered to 8
+bits. It keeps YouTube's colors and timing; only the steps go. It follows the
+on/off switch and Ctrl+Alt+D, so toggling compares both.
+
+To read YouTube's canvases, the script has the storyboard images load with
+CORS, which YouTube's image server allows. If one ever doesn't, that glow is
+left as YouTube draws it. The redraw only runs when YouTube changes the
+thumbnail (every few seconds while playing) and during its crossfade, and a
+large glow is rendered at up to 4 megapixels and scaled up by the browser.
+
 ## Renderers
 
 **Renderer** on the Advanced tab picks the graphics API. **Auto** (the
@@ -327,8 +350,9 @@ data resets them.
 ### Pages
 
 Watch pages, theater mode, fullscreen and embeds (including
-youtube-nocookie.com). YouTube Music is excluded. Shorts and m.youtube.com
-are untested, and on mobile there is no DB button. Codec switching and the
+youtube-nocookie.com). YouTube Music is excluded. Shorts work, their Ambient
+mode included (tried in Edge). m.youtube.com is untested, and on mobile there
+is no DB button. Codec switching and the
 preferred quality are untested in embeds.
 
 ### Videos it skips
